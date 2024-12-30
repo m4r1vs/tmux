@@ -746,8 +746,8 @@ struct colour_palette {
 #define CELL_OUTSIDE 12
 
 /* Cell borders. */
-#define CELL_BORDERS " xqlkmjwvtun~"
-#define SIMPLE_BORDERS " |-+++++++++."
+#define CELL_BORDERS "             "
+#define SIMPLE_BORDERS "             "
 #define PADDED_BORDERS "             "
 
 /* Grid cell data. */
