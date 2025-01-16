@@ -29,6 +29,19 @@
 
 #include "tmux.h"
 
+enum mouse_where {
+	NOWHERE,
+	PANE,
+	STATUS,
+	STATUS_LEFT,
+	STATUS_RIGHT,
+	STATUS_DEFAULT,
+	BORDER,
+	SCROLLBAR_UP,
+	SCROLLBAR_SLIDER,
+	SCROLLBAR_DOWN
+};
+
 static void	server_client_free(int, short, void *);
 static void	server_client_check_pane_resize(struct window_pane *);
 static void	server_client_check_pane_buffer(struct window_pane *);
@@ -42,8 +55,6 @@ static void	server_client_check_modes(struct client *);
 static void	server_client_set_title(struct client *);
 static void	server_client_set_path(struct client *);
 static void	server_client_reset_state(struct client *);
-static int 	server_client_is_bracket_pasting(struct client *, key_code);
-static int	server_client_assume_paste(struct session *);
 static void	server_client_update_latest(struct client *);
 
 static void	server_client_dispatch(struct imsg *, void *);
@@ -68,7 +79,7 @@ RB_GENERATE(client_windows, client_window, entry, server_client_window_cmp);
 u_int
 server_client_how_many(void)
 {
-	struct client  	*c;
+	struct client	*c;
 	u_int		 n;
 
 	n = 0;
@@ -119,6 +130,7 @@ server_client_set_overlay(struct client *c, u_int delay,
 		c->tty.flags |= TTY_FREEZE;
 	if (c->overlay_mode == NULL)
 		c->tty.flags |= TTY_NOCURSOR;
+	window_update_focus(c->session->curw->window);
 	server_redraw_client(c);
 }
 
@@ -143,6 +155,7 @@ server_client_clear_overlay(struct client *c)
 	c->overlay_data = NULL;
 
 	c->tty.flags &= ~(TTY_FREEZE|TTY_NOCURSOR);
+	window_update_focus(c->session->curw->window);
 	server_redraw_client(c);
 }
 
@@ -566,15 +579,96 @@ server_client_exec(struct client *c, const char *cmd)
 	free(msg);
 }
 
+static enum mouse_where
+server_client_check_mouse_in_pane(struct window_pane *wp, u_int px, u_int py,
+    u_int *sl_mpos)
+{
+	struct window		*w = wp->window;
+	struct options		*wo = w->options;
+	struct window_pane	*fwp;
+	int			 pane_status, sb, sb_pos, sb_w, sb_pad;
+	u_int			 line, sl_top, sl_bottom;
+
+	sb = options_get_number(wo, "pane-scrollbars");
+	sb_pos = options_get_number(wo, "pane-scrollbars-position");
+	pane_status = options_get_number(wo, "pane-border-status");
+	sb_pos = options_get_number(wo, "pane-scrollbars-position");
+
+	if (window_pane_show_scrollbar(wp, sb)) {
+		sb_w = wp->scrollbar_style.width;
+		sb_pad = wp->scrollbar_style.pad;
+	} else {
+		sb_w = 0;
+		sb_pad = 0;
+	}
+	if (pane_status == PANE_STATUS_TOP)
+		line = wp->yoff - 1;
+	else if (pane_status == PANE_STATUS_BOTTOM)
+		line = wp->yoff + wp->sy;
+
+	/* Check if point is within the pane or scrollbar. */
+	if (((pane_status != PANE_STATUS_OFF && py != line) ||
+	    (wp->yoff == 0 && py < wp->sy) ||
+	    (py >= wp->yoff && py < wp->yoff + wp->sy)) &&
+	    ((sb_pos == PANE_SCROLLBARS_RIGHT &&
+	    px < wp->xoff + wp->sx + sb_pad + sb_w) ||
+	    (sb_pos == PANE_SCROLLBARS_LEFT &&
+	    px < wp->xoff + wp->sx - sb_pad - sb_w))) {
+		/* Check if in the scrollbar. */
+		if ((sb_pos == PANE_SCROLLBARS_RIGHT &&
+		    (px >= wp->xoff + wp->sx + sb_pad &&
+		    px < wp->xoff + wp->sx + sb_pad + sb_w)) ||
+		    (sb_pos == PANE_SCROLLBARS_LEFT &&
+		    (px >= wp->xoff - sb_pad - sb_w &&
+		    px < wp->xoff - sb_pad))) {
+			/* Check where inside the scrollbar. */
+			sl_top = wp->yoff + wp->sb_slider_y;
+			sl_bottom = (wp->yoff + wp->sb_slider_y +
+			    wp->sb_slider_h - 1);
+			if (py < sl_top)
+				return (SCROLLBAR_UP);
+			else if (py >= sl_top &&
+				 py <= sl_bottom) {
+				*sl_mpos = (py - wp->sb_slider_y - wp->yoff);
+				return (SCROLLBAR_SLIDER);
+			} else /* py > sl_bottom */
+				return (SCROLLBAR_DOWN);
+		} else {
+			/* Must be inside the pane. */
+			return (PANE);
+		}
+	} else if (~w->flags & WINDOW_ZOOMED) {
+		/* Try the pane borders if not zoomed. */
+		TAILQ_FOREACH(fwp, &w->panes, entry) {
+			if ((((sb_pos == PANE_SCROLLBARS_RIGHT &&
+			    fwp->xoff + fwp->sx + sb_pad + sb_w == px) ||
+			    (sb_pos == PANE_SCROLLBARS_LEFT &&
+			    fwp->xoff + fwp->sx == px)) &&
+			    fwp->yoff <= 1 + py &&
+			    fwp->yoff + fwp->sy >= py) ||
+			    (fwp->yoff + fwp->sy == py &&
+			    fwp->xoff <= 1 + px &&
+			    fwp->xoff + fwp->sx >= px))
+				break;
+		}
+		if (fwp != NULL) {
+			wp = fwp;
+			return (BORDER);
+		}
+	}
+	return (NOWHERE);
+}
+
 /* Check for mouse keys. */
 static key_code
 server_client_check_mouse(struct client *c, struct key_event *event)
 {
 	struct mouse_event	*m = &event->m;
 	struct session		*s = c->session, *fs;
+	struct window		*w = s->curw->window;
 	struct winlink		*fwl;
 	struct window_pane	*wp, *fwp;
-	u_int			 x, y, b, sx, sy, px, py;
+	u_int			 x, y, b, sx, sy, px, py, sl_mpos = 0;
 	int			 ignore = 0;
 	key_code		 key;
 	struct timeval		 tv;
@@ -588,13 +682,7 @@ server_client_check_mouse(struct client *c, struct key_event *event)
 	       SECOND,
 	       DOUBLE,
 	       TRIPLE } type = NOTYPE;
-	enum { NOWHERE,
-	       PANE,
-	       STATUS,
-	       STATUS_LEFT,
-	       STATUS_RIGHT,
-	       STATUS_DEFAULT,
-	       BORDER } where = NOWHERE;
+	enum mouse_where where = NOWHERE;
 
 	log_debug("%s mouse %02x at %u,%u (last %u,%u) (%d)", c->name, m->b,
 	    m->x, m->y, m->lx, m->ly, c->tty.mouse_drag_flag);
@@ -743,62 +831,66 @@ have_event:
 		}
 	}
 
-	/* Not on status line. Adjust position and check for border or pane. */
+	/*
+	 * Not on status line. Adjust position and check for border, pane, or
+	 * scrollbar.
+	 */
 	if (where == NOWHERE) {
-		px = x;
-		if (m->statusat == 0 && y >= m->statuslines)
-			py = y - m->statuslines;
-		else if (m->statusat > 0 && y >= (u_int)m->statusat)
-			py = m->statusat - 1;
-		else
-			py = y;
-
-		tty_window_offset(&c->tty, &m->ox, &m->oy, &sx, &sy);
-		log_debug("mouse window @%u at %u,%u (%ux%u)",
-		    s->curw->window->id, m->ox, m->oy, sx, sy);
-		if (px > sx || py > sy)
-			return (KEYC_UNKNOWN);
-		px = px + m->ox;
-		py = py + m->oy;
-
-		/* Try the pane borders if not zoomed. */
-		if (~s->curw->window->flags & WINDOW_ZOOMED) {
-			TAILQ_FOREACH(wp, &s->curw->window->panes, entry) {
-				if ((wp->xoff + wp->sx == px &&
-				    wp->yoff <= 1 + py &&
-				    wp->yoff + wp->sy >= py) ||
-				    (wp->yoff + wp->sy == py &&
-				    wp->xoff <= 1 + px &&
-				    wp->xoff + wp->sx >= px))
-					break;
-			}
-			if (wp != NULL)
-				where = BORDER;
-		}
-
-		/* Otherwise try inside the pane. */
-		if (where == NOWHERE) {
-			wp = window_get_active_at(s->curw->window, px, py);
-			if (wp != NULL)
-				where = PANE;
+		if (c->tty.mouse_scrolling_flag)
+			where = SCROLLBAR_SLIDER;
+		else {
+			px = x;
+			if (m->statusat == 0 && y >= m->statuslines)
+				py = y - m->statuslines;
+			else if (m->statusat > 0 && y >= (u_int)m->statusat)
+				py = m->statusat - 1;
 			else
+				py = y;
+
+			tty_window_offset(&c->tty, &m->ox, &m->oy, &sx, &sy);
+			log_debug("mouse window @%u at %u,%u (%ux%u)",
+				  w->id, m->ox, m->oy, sx, sy);
+			if (px > sx || py > sy)
 				return (KEYC_UNKNOWN);
+			px = px + m->ox;
+			py = py + m->oy;
+
+			/* Try inside the pane. */
+			wp = window_get_active_at(w, px, py);
+			if (wp == NULL)
+				return (KEYC_UNKNOWN);
+			where = server_client_check_mouse_in_pane(wp, px, py,
+			    &sl_mpos);
+
+			if (where == PANE) {
+				log_debug("mouse %u,%u on pane %%%u", x, y,
+				    wp->id);
+			} else if (where == BORDER)
+				log_debug("mouse on pane %%%u border", wp->id);
+			else if (where == SCROLLBAR_UP ||
+			    where == SCROLLBAR_SLIDER ||
+			    where == SCROLLBAR_DOWN) {
+				log_debug("mouse on pane %%%u scrollbar",
+				    wp->id);
+			}
+			m->wp = wp->id;
+			m->w = wp->window->id;
 		}
-		if (where == PANE)
-			log_debug("mouse %u,%u on pane %%%u", x, y, wp->id);
-		else if (where == BORDER)
-			log_debug("mouse on pane %%%u border", wp->id);
-		m->wp = wp->id;
-		m->w = wp->window->id;
-	}
+	} else
+		m->wp = -1;
 
 	/* Stop dragging if needed. */
-	if (type != DRAG && type != WHEEL && c->tty.mouse_drag_flag != 0) {
+	if (type != DRAG &&
+	    type != WHEEL &&
+	    type != DOUBLE &&
+	    type != TRIPLE &&
+	    c->tty.mouse_drag_flag != 0) {
 		if (c->tty.mouse_drag_release != NULL)
 			c->tty.mouse_drag_release(c, m);
 
 		c->tty.mouse_drag_update = NULL;
 		c->tty.mouse_drag_release = NULL;
+		c->tty.mouse_scrolling_flag = 0;
 
 		/*
 		 * End a mouse drag by passing a MouseDragEnd key corresponding
@@ -816,6 +908,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND1_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND1_BORDER;
 			break;
@@ -830,6 +924,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND2_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND2_BORDER;
 			break;
@@ -844,6 +940,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND3_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND3_BORDER;
 			break;
@@ -858,6 +956,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND6_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND6_BORDER;
 			break;
@@ -872,6 +972,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND7_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND7_BORDER;
 			break;
@@ -886,6 +988,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND8_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND8_BORDER;
 			break;
@@ -900,6 +1004,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND9_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND9_BORDER;
 			break;
@@ -914,6 +1020,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND10_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND10_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND10_BORDER;
 			break;
@@ -928,6 +1036,8 @@ have_event:
 				key = KEYC_MOUSEDRAGEND11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDRAGEND11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDRAGEND11_SCROLLBAR_SLIDER;
 			if (where == BORDER)
 				key = KEYC_MOUSEDRAGEND11_BORDER;
 			break;
@@ -936,6 +1046,7 @@ have_event:
 			break;
 		}
 		c->tty.mouse_drag_flag = 0;
+		c->tty.mouse_slider_mpos = -1;
 		goto out;
 	}
 
@@ -974,6 +1085,12 @@ have_event:
 					key = KEYC_MOUSEDRAG1_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG1_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG1_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG1_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG1_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG1_BORDER;
 				break;
@@ -988,6 +1105,12 @@ have_event:
 					key = KEYC_MOUSEDRAG2_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG2_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG2_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG2_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG2_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG2_BORDER;
 				break;
@@ -1002,6 +1125,12 @@ have_event:
 					key = KEYC_MOUSEDRAG3_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG3_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG3_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG3_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG3_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG3_BORDER;
 				break;
@@ -1016,6 +1145,12 @@ have_event:
 					key = KEYC_MOUSEDRAG6_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG6_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG6_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG6_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG6_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG6_BORDER;
 				break;
@@ -1030,6 +1165,12 @@ have_event:
 					key = KEYC_MOUSEDRAG7_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG7_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG7_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG7_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG7_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG7_BORDER;
 				break;
@@ -1044,6 +1185,12 @@ have_event:
 					key = KEYC_MOUSEDRAG8_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG8_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG8_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG8_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG8_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG8_BORDER;
 				break;
@@ -1058,6 +1205,12 @@ have_event:
 					key = KEYC_MOUSEDRAG9_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG9_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG9_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG9_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG9_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG9_BORDER;
 				break;
@@ -1072,6 +1225,12 @@ have_event:
 					key = KEYC_MOUSEDRAG10_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG10_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG10_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG10_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG10_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG10_BORDER;
 				break;
@@ -1086,6 +1245,12 @@ have_event:
 					key = KEYC_MOUSEDRAG11_STATUS_RIGHT;
 				if (where == STATUS_DEFAULT)
 					key = KEYC_MOUSEDRAG11_STATUS_DEFAULT;
+				if (where == SCROLLBAR_UP)
+					key = KEYC_MOUSEDRAG11_SCROLLBAR_UP;
+				if (where == SCROLLBAR_SLIDER)
+					key = KEYC_MOUSEDRAG11_SCROLLBAR_SLIDER;
+				if (where == SCROLLBAR_DOWN)
+					key = KEYC_MOUSEDRAG11_SCROLLBAR_DOWN;
 				if (where == BORDER)
 					key = KEYC_MOUSEDRAG11_BORDER;
 				break;
@@ -1094,9 +1259,16 @@ have_event:
 
 		/*
 		 * Begin a drag by setting the flag to a non-zero value that
-		 * corresponds to the mouse button in use.
+		 * corresponds to the mouse button in use. If starting to drag
+		 * the scrollbar, store the relative position in the slider
+		 * where the user grabbed.
 		 */
 		c->tty.mouse_drag_flag = MOUSE_BUTTONS(b) + 1;
+		if (c->tty.mouse_scrolling_flag == 0 &&
+		    where == SCROLLBAR_SLIDER) {
+			c->tty.mouse_scrolling_flag = 1;
+			c->tty.mouse_slider_mpos = sl_mpos;
+		}
 		break;
 	case WHEEL:
 		if (MOUSE_BUTTONS(b) == MOUSE_WHEEL_UP) {
@@ -1140,6 +1312,12 @@ have_event:
 				key = KEYC_MOUSEUP1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP1_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP1_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP1_BORDER;
 			break;
@@ -1154,6 +1332,12 @@ have_event:
 				key = KEYC_MOUSEUP2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP2_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP2_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP2_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP2_BORDER;
 			break;
@@ -1168,6 +1352,12 @@ have_event:
 				key = KEYC_MOUSEUP3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP3_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP3_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP3_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP3_BORDER;
 			break;
@@ -1182,6 +1372,12 @@ have_event:
 				key = KEYC_MOUSEUP6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP6_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP6_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP6_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP6_BORDER;
 			break;
@@ -1196,6 +1392,12 @@ have_event:
 				key = KEYC_MOUSEUP7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP7_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP7_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP7_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP7_BORDER;
 			break;
@@ -1210,6 +1412,12 @@ have_event:
 				key = KEYC_MOUSEUP8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP8_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP8_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP8_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP8_BORDER;
 			break;
@@ -1224,6 +1432,12 @@ have_event:
 				key = KEYC_MOUSEUP9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP9_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP9_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP9_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP9_BORDER;
 			break;
@@ -1237,7 +1451,13 @@ have_event:
 			if (where == STATUS_RIGHT)
 				key = KEYC_MOUSEUP1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
-				key = KEYC_MOUSEUP1_STATUS_DEFAULT;
+				key = KEYC_MOUSEUP10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP10_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP10_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP1_BORDER;
 			break;
@@ -1252,6 +1472,12 @@ have_event:
 				key = KEYC_MOUSEUP11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEUP11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEUP11_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEUP11_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEUP11_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEUP11_BORDER;
 			break;
@@ -1270,6 +1496,12 @@ have_event:
 				key = KEYC_MOUSEDOWN1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN1_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN1_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN1_BORDER;
 			break;
@@ -1284,6 +1516,12 @@ have_event:
 				key = KEYC_MOUSEDOWN2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN2_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN2_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN2_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN2_BORDER;
 			break;
@@ -1298,6 +1536,12 @@ have_event:
 				key = KEYC_MOUSEDOWN3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN3_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN3_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN3_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN3_BORDER;
 			break;
@@ -1312,6 +1556,12 @@ have_event:
 				key = KEYC_MOUSEDOWN6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN6_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN6_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN6_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN6_BORDER;
 			break;
@@ -1326,6 +1576,12 @@ have_event:
 				key = KEYC_MOUSEDOWN7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN7_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN7_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN7_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN7_BORDER;
 			break;
@@ -1340,6 +1596,12 @@ have_event:
 				key = KEYC_MOUSEDOWN8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN8_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN8_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN8_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN8_BORDER;
 			break;
@@ -1354,6 +1616,12 @@ have_event:
 				key = KEYC_MOUSEDOWN9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN9_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN9_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN9_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN9_BORDER;
 			break;
@@ -1368,6 +1636,12 @@ have_event:
 				key = KEYC_MOUSEDOWN10_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN10_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN10_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN10_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN10_BORDER;
 			break;
@@ -1382,6 +1656,12 @@ have_event:
 				key = KEYC_MOUSEDOWN11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_MOUSEDOWN11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_MOUSEDOWN11_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_MOUSEDOWN11_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_MOUSEDOWN11_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_MOUSEDOWN11_BORDER;
 			break;
@@ -1400,6 +1680,12 @@ have_event:
 				key = KEYC_SECONDCLICK1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK1_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK1_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK1_BORDER;
 			break;
@@ -1414,6 +1700,12 @@ have_event:
 				key = KEYC_SECONDCLICK2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK2_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK2_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK2_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK2_BORDER;
 			break;
@@ -1428,6 +1720,12 @@ have_event:
 				key = KEYC_SECONDCLICK3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK3_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK3_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK3_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK3_BORDER;
 			break;
@@ -1442,6 +1740,12 @@ have_event:
 				key = KEYC_SECONDCLICK6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK6_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK6_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK6_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK6_BORDER;
 			break;
@@ -1456,6 +1760,12 @@ have_event:
 				key = KEYC_SECONDCLICK7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK7_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK7_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK7_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK7_BORDER;
 			break;
@@ -1470,6 +1780,12 @@ have_event:
 				key = KEYC_SECONDCLICK8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK8_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK8_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK8_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK8_BORDER;
 			break;
@@ -1484,6 +1800,12 @@ have_event:
 				key = KEYC_SECONDCLICK9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK9_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK9_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK9_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK9_BORDER;
 			break;
@@ -1498,6 +1820,12 @@ have_event:
 				key = KEYC_SECONDCLICK10_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK10_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK10_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK10_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK10_BORDER;
 			break;
@@ -1512,6 +1840,12 @@ have_event:
 				key = KEYC_SECONDCLICK11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_SECONDCLICK11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_SECONDCLICK11_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_SECONDCLICK11_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_SECONDCLICK11_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_SECONDCLICK11_BORDER;
 			break;
@@ -1530,6 +1864,12 @@ have_event:
 				key = KEYC_DOUBLECLICK1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK1_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK1_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK1_BORDER;
 			break;
@@ -1544,6 +1884,12 @@ have_event:
 				key = KEYC_DOUBLECLICK2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK2_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK2_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK2_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK2_BORDER;
 			break;
@@ -1558,6 +1904,12 @@ have_event:
 				key = KEYC_DOUBLECLICK3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK3_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK3_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK3_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK3_BORDER;
 			break;
@@ -1572,6 +1924,12 @@ have_event:
 				key = KEYC_DOUBLECLICK6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK6_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK6_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK6_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK6_BORDER;
 			break;
@@ -1586,6 +1944,12 @@ have_event:
 				key = KEYC_DOUBLECLICK7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK7_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK7_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK7_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK7_BORDER;
 			break;
@@ -1600,6 +1964,12 @@ have_event:
 				key = KEYC_DOUBLECLICK8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK8_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK8_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK8_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK8_BORDER;
 			break;
@@ -1614,6 +1984,12 @@ have_event:
 				key = KEYC_DOUBLECLICK9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK9_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK9_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK9_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK9_BORDER;
 			break;
@@ -1628,6 +2004,12 @@ have_event:
 				key = KEYC_DOUBLECLICK10_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK10_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK10_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK10_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK10_BORDER;
 			break;
@@ -1642,6 +2024,12 @@ have_event:
 				key = KEYC_DOUBLECLICK11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_DOUBLECLICK11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_DOUBLECLICK11_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_DOUBLECLICK11_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_DOUBLECLICK11_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_DOUBLECLICK11_BORDER;
 			break;
@@ -1660,6 +2048,12 @@ have_event:
 				key = KEYC_TRIPLECLICK1_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK1_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK1_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK1_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK1_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK1_BORDER;
 			break;
@@ -1674,6 +2068,12 @@ have_event:
 				key = KEYC_TRIPLECLICK2_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK2_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK2_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK2_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK2_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK2_BORDER;
 			break;
@@ -1688,6 +2088,12 @@ have_event:
 				key = KEYC_TRIPLECLICK3_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK3_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK3_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK3_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK3_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK3_BORDER;
 			break;
@@ -1702,6 +2108,12 @@ have_event:
 				key = KEYC_TRIPLECLICK6_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK6_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK6_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK6_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK6_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK6_BORDER;
 			break;
@@ -1716,6 +2128,12 @@ have_event:
 				key = KEYC_TRIPLECLICK7_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK7_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK7_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK7_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK7_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK7_BORDER;
 			break;
@@ -1730,6 +2148,12 @@ have_event:
 				key = KEYC_TRIPLECLICK8_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK8_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK8_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK8_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK8_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK8_BORDER;
 			break;
@@ -1744,6 +2168,12 @@ have_event:
 				key = KEYC_TRIPLECLICK9_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK9_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK9_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK9_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK9_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK9_BORDER;
 			break;
@@ -1758,6 +2188,12 @@ have_event:
 				key = KEYC_TRIPLECLICK10_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK10_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK10_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK10_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK10_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK10_BORDER;
 			break;
@@ -1772,6 +2208,12 @@ have_event:
 				key = KEYC_TRIPLECLICK11_STATUS_RIGHT;
 			if (where == STATUS_DEFAULT)
 				key = KEYC_TRIPLECLICK11_STATUS_DEFAULT;
+			if (where == SCROLLBAR_UP)
+				key = KEYC_TRIPLECLICK11_SCROLLBAR_UP;
+			if (where == SCROLLBAR_SLIDER)
+				key = KEYC_TRIPLECLICK11_SCROLLBAR_SLIDER;
+			if (where == SCROLLBAR_DOWN)
+				key = KEYC_TRIPLECLICK11_SCROLLBAR_DOWN;
 			if (where == BORDER)
 				key = KEYC_TRIPLECLICK11_BORDER;
 			break;
@@ -1797,18 +2239,18 @@ out:
 
 /* Is this a bracket paste key? */
 static int
-server_client_is_bracket_pasting(struct client *c, key_code key)
+server_client_is_bracket_paste(struct client *c, key_code key)
 {
 	if (key == KEYC_PASTE_START) {
 		c->flags |= CLIENT_BRACKETPASTING;
 		log_debug("%s: bracket paste on", c->name);
-		return (1);
+		return (0);
 	}
 
 	if (key == KEYC_PASTE_END) {
 		c->flags &= ~CLIENT_BRACKETPASTING;
 		log_debug("%s: bracket paste off", c->name);
-		return (1);
+		return (0);
 	}
 
 	return !!(c->flags & CLIENT_BRACKETPASTING);
@@ -1816,25 +2258,29 @@ server_client_is_bracket_pasting(struct client *c, key_code key)
 
 /* Is this fast enough to probably be a paste? */
 static int
-server_client_assume_paste(struct session *s)
+server_client_is_assume_paste(struct client *c)
 {
-	struct timeval	tv;
-	int		t;
+	struct session	*s = c->session;
+	struct timeval	 tv;
+	int		 t;
 
+	if (c->flags & CLIENT_BRACKETPASTING)
+		return (0);
 	if ((t = options_get_number(s->options, "assume-paste-time")) == 0)
 		return (0);
 
-	timersub(&s->activity_time, &s->last_activity_time, &tv);
+	timersub(&c->activity_time, &c->last_activity_time, &tv);
 	if (tv.tv_sec == 0 && tv.tv_usec < t * 1000) {
-		log_debug("session %s pasting (flag %d)", s->name,
-		    !!(s->flags & SESSION_PASTING));
-		if (s->flags & SESSION_PASTING)
+		if (c->flags & CLIENT_ASSUMEPASTING)
 			return (1);
-		s->flags |= SESSION_PASTING;
+		c->flags |= CLIENT_ASSUMEPASTING;
+		log_debug("%s: assume paste on", c->name);
 		return (0);
 	}
-	log_debug("session %s not pasting", s->name);
-	s->flags &= ~SESSION_PASTING;
+	if (c->flags & CLIENT_ASSUMEPASTING) {
+		c->flags &= ~CLIENT_ASSUMEPASTING;
+		log_debug("%s: assume paste off", c->name);
+	}
 	return (0);
 }
 
@@ -1858,6 +2304,26 @@ server_client_update_latest(struct client *c)
 	notify_client("client-active", c);
 }
 
+/* Get repeat time. */
+static u_int
+server_client_repeat_time(struct client *c, struct key_binding *bd)
+{
+	struct session	*s = c->session;
+	u_int		 repeat, initial;
+
+	if (~bd->flags & KEY_BINDING_REPEAT)
+		return (0);
+	repeat = options_get_number(s->options, "repeat-time");
+	if (repeat == 0)
+		return (0);
+	if ((~c->flags & CLIENT_REPEAT) || bd->key != c->last_key) {
+		initial = options_get_number(s->options, "initial-repeat-time");
+		if (initial != 0)
+			repeat = initial;
+	}
+	return (repeat);
+}
+
 /*
  * Handle data key input from client. This owns and can modify the key event it
  * is given and is responsible for freeing it.
@@ -1876,7 +2342,7 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 	struct timeval			 tv;
 	struct key_table		*table, *first;
 	struct key_binding		*bd;
-	int				 xtimeout;
+	u_int				 repeat;
 	uint64_t			 flags, prefix_delay;
 	struct cmd_find_state		 fs;
 	key_code			 key0, prefix, prefix2;
@@ -1887,6 +2353,8 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 	wl = s->curw;
 
 	/* Update the activity timer. */
+	memcpy(&c->last_activity_time, &c->activity_time,
+	    sizeof c->last_activity_time);
 	if (gettimeofday(&c->activity_time, NULL) != 0)
 		fatal("gettimeofday failed");
 	session_update_activity(s, &c->activity_time);
@@ -1924,14 +2392,16 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 		goto forward_key;
 
 	/* Forward if bracket pasting. */
-	if (server_client_is_bracket_pasting(c, key))
-		goto forward_key;
+	if (server_client_is_bracket_paste (c, key))
+		goto paste_key;
 
 	/* Treat everything as a regular key when pasting is detected. */
 	if (!KEYC_IS_MOUSE(key) &&
+	    key != KEYC_FOCUS_IN &&
+	    key != KEYC_FOCUS_OUT &&
 	    (~key & KEYC_SENT) &&
-	    server_client_assume_paste(s))
-		goto forward_key;
+	    server_client_is_assume_paste(c))
+		goto paste_key;
 
 	/*
 	 * Work out the current key table. If the pane is in a mode, use
@@ -2028,12 +2498,13 @@ try_again:
 		 * If this is a repeating key, start the timer. Otherwise reset
 		 * the client back to the root table.
 		 */
-		xtimeout = options_get_number(s->options, "repeat-time");
-		if (xtimeout != 0 && (bd->flags & KEY_BINDING_REPEAT)) {
+		repeat = server_client_repeat_time(c, bd);
+		if (repeat != 0) {
 			c->flags |= CLIENT_REPEAT;
+			c->last_key = bd->key;
 
-			tv.tv_sec = xtimeout / 1000;
-			tv.tv_usec = (xtimeout % 1000) * 1000L;
+			tv.tv_sec = repeat / 1000;
+			tv.tv_usec = (repeat % 1000) * 1000L;
 			evtimer_del(&c->repeat_timer);
 			evtimer_add(&c->repeat_timer, &tv);
 		} else {
@@ -2100,10 +2571,20 @@ forward_key:
 		goto out;
 	if (wp != NULL)
 		window_pane_key(wp, c, s, wl, key, m);
+	goto out;
+
+paste_key:
+	if (c->flags & CLIENT_READONLY)
+		goto out;
+	if (event->buf != NULL)
+		window_pane_paste(wp, key, event->buf, event->len);
+	key = KEYC_NONE;
+	goto out;
 
 out:
 	if (s != NULL && key != KEYC_FOCUS_OUT)
 		server_client_update_latest(c);
+	free(event->buf);
 	free(event);
 	return (CMD_RETURN_NORMAL);
 }
@@ -2187,7 +2668,7 @@ server_client_loop(void)
 				server_client_check_pane_resize(wp);
 				server_client_check_pane_buffer(wp);
 			}
-			wp->flags &= ~PANE_REDRAW;
+			wp->flags &= ~(PANE_REDRAW|PANE_REDRAWSCROLLBAR);
 		}
 		check_window_name(w);
 	}
@@ -2415,8 +2896,10 @@ server_client_reset_state(struct client *c)
 	if (c->overlay_draw != NULL) {
 		if (c->overlay_mode != NULL)
 			s = c->overlay_mode(c, c->overlay_data, &cx, &cy);
-	} else
+	} else if (c->prompt_string == NULL)
 		s = wp->screen;
+	else
+		s = c->status.active;
 	if (s != NULL)
 		mode = s->mode;
 	if (log_get_level() != 0) {
@@ -2430,7 +2913,7 @@ server_client_reset_state(struct client *c)
 
 	/* Move cursor to pane cursor and offset. */
 	if (c->prompt_string != NULL) {
-		n = options_get_number(c->session->options, "status-position");
+		n = options_get_number(oo, "status-position");
 		if (n == 0)
 			cy = 0;
 		else {
@@ -2441,7 +2924,6 @@ server_client_reset_state(struct client *c)
 				cy = tty->sy - n;
 		}
 		cx = c->prompt_cursor;
-		mode &= ~MODE_CURSOR;
 	} else if (c->overlay_draw == NULL) {
 		cursor = 0;
 		tty_window_offset(tty, &ox, &oy, &sx, &sy);
@@ -2517,11 +2999,13 @@ server_client_click_timer(__unused int fd, __unused short events, void *data)
 		 * Waiting for a third click that hasn't happened, so this must
 		 * have been a double click.
 		 */
-		event = xmalloc(sizeof *event);
+		event = xcalloc(1, sizeof *event);
 		event->key = KEYC_DOUBLECLICK;
 		memcpy(&event->m, &c->click_event, sizeof event->m);
-		if (!server_client_handle_key(c, event))
+		if (!server_client_handle_key(c, event)) {
+			free(event->buf);
 			free(event);
+		}
 	}
 	c->flags &= ~(CLIENT_DOUBLECLICK|CLIENT_TRIPLECLICK);
 }
@@ -2616,7 +3100,7 @@ server_client_check_redraw(struct client *c)
 	struct window_pane	*wp;
 	int			 needed, tty_flags, mode = tty->mode;
 	uint64_t		 client_flags = 0;
-	int			 redraw;
+	int			 redraw_pane, redraw_scrollbar_only;
 	u_int			 bit = 0;
 	struct timeval		 tv = { .tv_usec = 1000 };
 	static struct event	 ev;
@@ -2625,12 +3109,13 @@ server_client_check_redraw(struct client *c)
 	if (c->flags & (CLIENT_CONTROL|CLIENT_SUSPENDED))
 		return;
 	if (c->flags & CLIENT_ALLREDRAWFLAGS) {
-		log_debug("%s: redraw%s%s%s%s%s", c->name,
+		log_debug("%s: redraw%s%s%s%s%s%s", c->name,
 		    (c->flags & CLIENT_REDRAWWINDOW) ? " window" : "",
 		    (c->flags & CLIENT_REDRAWSTATUS) ? " status" : "",
 		    (c->flags & CLIENT_REDRAWBORDERS) ? " borders" : "",
 		    (c->flags & CLIENT_REDRAWOVERLAY) ? " overlay" : "",
-		    (c->flags & CLIENT_REDRAWPANES) ? " panes" : "");
+		    (c->flags & CLIENT_REDRAWPANES) ? " panes" : "",
+		    (c->flags & CLIENT_REDRAWSCROLLBARS) ? " scrollbars" : "");
 	}
 
 	/*
@@ -2645,11 +3130,15 @@ server_client_check_redraw(struct client *c)
 		TAILQ_FOREACH(wp, &w->panes, entry) {
 			if (wp->flags & PANE_REDRAW) {
 				needed = 1;
+				client_flags |= CLIENT_REDRAWPANES;
 				break;
 			}
+			if (wp->flags & PANE_REDRAWSCROLLBAR) {
+				needed = 1;
+				client_flags |= CLIENT_REDRAWSCROLLBARS;
+				/* no break - later panes may need redraw */
+			}
 		}
-		if (needed)
-			client_flags |= CLIENT_REDRAWPANES;
 	}
 	if (needed && (left = EVBUFFER_LENGTH(tty->out)) != 0) {
 		log_debug("%s: redraw deferred (%zu left)", c->name, left);
@@ -2662,23 +3151,30 @@ server_client_check_redraw(struct client *c)
 
 		if (~c->flags & CLIENT_REDRAWWINDOW) {
 			TAILQ_FOREACH(wp, &w->panes, entry) {
-				if (wp->flags & PANE_REDRAW) {
+				if (wp->flags & (PANE_REDRAW)) {
 					log_debug("%s: pane %%%u needs redraw",
 					    c->name, wp->id);
 					c->redraw_panes |= (1 << bit);
+				} else if (wp->flags & PANE_REDRAWSCROLLBAR) {
+					log_debug("%s: pane %%%u scrollbar "
+					    "needs redraw", c->name, wp->id);
+					c->redraw_scrollbars |= (1 << bit);
 				}
 				if (++bit == 64) {
 					/*
 					 * If more that 64 panes, give up and
 					 * just redraw the window.
 					 */
-					client_flags &= CLIENT_REDRAWPANES;
+					client_flags &= ~(CLIENT_REDRAWPANES|
+					    CLIENT_REDRAWSCROLLBARS);
 					client_flags |= CLIENT_REDRAWWINDOW;
 					break;
 				}
 			}
 			if (c->redraw_panes != 0)
 				c->flags |= CLIENT_REDRAWPANES;
+			if (c->redraw_scrollbars != 0)
+				c->flags |= CLIENT_REDRAWSCROLLBARS;
 		}
 		c->flags |= client_flags;
 		return;
@@ -2694,19 +3190,32 @@ server_client_check_redraw(struct client *c)
 		 * needs to be redrawn.
 		 */
 		TAILQ_FOREACH(wp, &w->panes, entry) {
-			redraw = 0;
+			redraw_pane = 0;
+			redraw_scrollbar_only = 0;
 			if (wp->flags & PANE_REDRAW)
-				redraw = 1;
-			else if (c->flags & CLIENT_REDRAWPANES)
-				redraw = !!(c->redraw_panes & (1 << bit));
+				redraw_pane = 1;
+			else if (c->flags & CLIENT_REDRAWPANES) {
+				if (c->redraw_panes & (1 << bit))
+					redraw_pane = 1;
+			} else if (c->flags & CLIENT_REDRAWSCROLLBARS) {
+				if (c->redraw_scrollbars & (1 << bit))
+					redraw_scrollbar_only = 1;
+			}
 			bit++;
-			if (!redraw)
+			if (!redraw_pane && !redraw_scrollbar_only)
 				continue;
-			log_debug("%s: redrawing pane %%%u", __func__, wp->id);
-			screen_redraw_pane(c, wp);
+			if (redraw_scrollbar_only) {
+				log_debug("%s: redrawing (scrollbar only) pane "
+				    "%%%u", __func__, wp->id);
+			} else {
+				log_debug("%s: redrawing pane %%%u", __func__,
+				    wp->id);
+			}
+			screen_redraw_pane(c, wp, redraw_scrollbar_only);
 		}
 		c->redraw_panes = 0;
-		c->flags &= ~CLIENT_REDRAWPANES;
+		c->redraw_scrollbars = 0;
+		c->flags &= ~(CLIENT_REDRAWPANES|CLIENT_REDRAWSCROLLBARS);
 	}
 
 	if (c->flags & CLIENT_ALLREDRAWFLAGS) {
@@ -3093,6 +3602,7 @@ server_client_dispatch_identify(struct client *c, struct imsg *imsg)
 
 #ifdef __CYGWIN__
 	c->fd = open(c->ttyname, O_RDWR|O_NOCTTY);
+	c->out_fd = dup(c->fd);
 #endif
 
 	if (c->flags & CLIENT_CONTROL)
@@ -3196,6 +3706,8 @@ server_client_set_flags(struct client *c, const char *flags)
 			flag = CLIENT_IGNORESIZE;
 		else if (strcmp(next, "active-pane") == 0)
 			flag = CLIENT_ACTIVEPANE;
+		else if (strcmp(next, "no-detach-on-destroy") == 0)
+			flag = CLIENT_NO_DETACH_ON_DESTROY;
 		if (flag == 0)
 			continue;
 
@@ -3218,7 +3730,7 @@ const char *
 server_client_get_flags(struct client *c)
 {
 	static char	s[256];
-	char	 	tmp[32];
+	char		tmp[32];
 
 	*s = '\0';
 	if (c->flags & CLIENT_ATTACHED)
@@ -3229,6 +3741,8 @@ server_client_get_flags(struct client *c)
 		strlcat(s, "control-mode,", sizeof s);
 	if (c->flags & CLIENT_IGNORESIZE)
 		strlcat(s, "ignore-size,", sizeof s);
+	if (c->flags & CLIENT_NO_DETACH_ON_DESTROY)
+		strlcat(s, "no-detach-on-destroy,", sizeof s);
 	if (c->flags & CLIENT_CONTROL_NOOUTPUT)
 		strlcat(s, "no-output,", sizeof s);
 	if (c->flags & CLIENT_CONTROL_WAITEXIT)
@@ -3333,17 +3847,21 @@ server_client_print(struct client *c, int parse, struct evbuffer *evb)
 	size_t				 size = EVBUFFER_LENGTH(evb);
 	struct window_pane		*wp;
 	struct window_mode_entry	*wme;
-	char				*sanitized, *msg, *line;
+	char				*sanitized, *msg, *line, empty = '\0';
 
 	if (!parse) {
 		utf8_stravisx(&msg, data, size,
 		    VIS_OCTAL|VIS_CSTYLE|VIS_NOSLASH);
-		log_debug("%s: %s", __func__, msg);
 	} else {
-		msg = EVBUFFER_DATA(evb);
-		if (msg[size - 1] != '\0')
-			evbuffer_add(evb, "", 1);
+		if (size == 0)
+			msg = &empty;
+		else {
+			msg = EVBUFFER_DATA(evb);
+			if (msg[size - 1] != '\0')
+				evbuffer_add(evb, "", 1);
+		}
 	}
+	log_debug("%s: %s", __func__, msg);
 
 	if (c == NULL)
 		goto out;

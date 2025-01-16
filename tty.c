@@ -42,7 +42,6 @@ static void	tty_cursor_pane(struct tty *, const struct tty_ctx *, u_int,
 		    u_int);
 static void	tty_cursor_pane_unless_wrap(struct tty *,
 		    const struct tty_ctx *, u_int, u_int);
-static void	tty_invalidate(struct tty *);
 static void	tty_colours(struct tty *, const struct grid_cell *);
 static void	tty_check_fg(struct tty *, struct colour_palette *,
     		    struct grid_cell *);
@@ -140,6 +139,14 @@ tty_resize(struct tty *tty)
 			ypixel = 0;
 		} else
 			ypixel = ws.ws_ypixel / sy;
+
+		if ((xpixel == 0 || ypixel == 0) &&
+		    tty->out != NULL &&
+		    !(tty->flags & TTY_WINSIZEQUERY) &&
+		    (tty->term->flags & TERM_VT100LIKE)) {
+			tty_puts(tty, "\033[18t\033[14t");
+			tty->flags |= TTY_WINSIZEQUERY;
+		}
 	} else {
 		sx = 80;
 		sy = 24;
@@ -1359,6 +1366,8 @@ tty_check_codeset(struct tty *tty, const struct grid_cell *gc)
 	/* Characters less than 0x7f are always fine, no matter what. */
 	if (gc->data.size == 1 && *gc->data.data < 0x7f)
 		return (gc);
+	if (gc->flags & GRID_FLAG_TAB)
+		return (gc);
 
 	/* UTF-8 terminal and a UTF-8 character - fine. */
 	if (tty->client->flags & CLIENT_UTF8)
@@ -2369,7 +2378,7 @@ tty_reset(struct tty *tty)
 	memcpy(&tty->last_cell, &grid_default_cell, sizeof tty->last_cell);
 }
 
-static void
+void
 tty_invalidate(struct tty *tty)
 {
 	memcpy(&tty->cell, &grid_default_cell, sizeof tty->cell);
@@ -2871,6 +2880,8 @@ tty_check_fg(struct tty *tty, struct colour_palette *palette,
 				gc->fg &= 7;
 				if (colours >= 16)
 					gc->fg += 90;
+				else if (gc->fg == 0 && gc->bg == 0)
+					gc->fg = 7;
 			}
 		}
 		return;
