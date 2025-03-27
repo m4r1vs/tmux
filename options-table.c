@@ -285,6 +285,13 @@ const struct options_table_entry options_table[] = {
 	  .text = "Style of the cursor."
 	},
 
+	{ .name = "default-client-command",
+	  .type = OPTIONS_TABLE_COMMAND,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_str = "new-session",
+	  .text = "Default command to run when tmux is run without a command."
+	},
+
 	{ .name = "default-terminal",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,
@@ -1454,6 +1461,8 @@ const struct options_table_entry options_table[] = {
 	OPTIONS_TABLE_HOOK("client-focus-out", ""),
 	OPTIONS_TABLE_HOOK("client-resized", ""),
 	OPTIONS_TABLE_HOOK("client-session-changed", ""),
+	OPTIONS_TABLE_HOOK("client-light-theme", ""),
+	OPTIONS_TABLE_HOOK("client-dark-theme", ""),
 	OPTIONS_TABLE_HOOK("command-error", ""),
 	OPTIONS_TABLE_PANE_HOOK("pane-died", ""),
 	OPTIONS_TABLE_PANE_HOOK("pane-exited", ""),

@@ -254,9 +254,10 @@ was given) and off.
 This specifies one of a set of commands used to control
 .Nm ,
 as described in the following sections.
-If no commands are specified, the
-.Ic new-session
-command is assumed.
+If no commands are specified, the command in
+.Ic default-client-command
+is assumed, which defaults to
+.Ic new-session .
 .El
 .Sh DEFAULT KEY BINDINGS
 .Nm
@@ -2331,6 +2332,15 @@ repeats the last search and
 does the same but reverses the direction (forward becomes backward and backward
 becomes forward).
 .Pp
+The default incremental search key bindings,
+.Ql C-r
+and
+.Ql C-s ,
+are designed to emulate
+.Xr emacs 1 .
+When first pressed they allow a new search term to be entered; if pressed with
+an empty search term they repeat the previously used search term.
+.Pp
 The
 .Ql next-prompt
 and
@@ -2547,7 +2557,7 @@ but a different format may be specified with
 .Fl F .
 .Tg capturep
 .It Xo Ic capture-pane
-.Op Fl aAepPqCJN
+.Op Fl aepPqCJMN
 .Op Fl b Ar buffer-name
 .Op Fl E Ar end-line
 .Op Fl S Ar start-line
@@ -2566,6 +2576,9 @@ is given, the alternate screen is used, and the history is not accessible.
 If no alternate screen exists, an error will be returned unless
 .Fl q
 is given.
+Similarly, if the pane is in a mode,
+.Fl M
+uses the screen for the mode.
 If
 .Fl e
 is given, the output includes escape sequences for text and background
@@ -2703,6 +2716,8 @@ The following keys may be used in tree mode:
 .It Li "Enter" Ta "Choose selected item"
 .It Li "Up" Ta "Select previous item"
 .It Li "Down" Ta "Select next item"
+.It Li "S-Up" Ta "Swap the current window with the previous one"
+.It Li "S-Down" Ta "Swap the current window with the next one"
 .It Li "+" Ta "Expand selected item"
 .It Li "-" Ta "Collapse selected item"
 .It Li "M-+" Ta "Expand all items"
@@ -4071,6 +4086,10 @@ where the number is a hexadecimal number.
 Give the command to pipe to if the
 .Ic copy-pipe
 copy mode command is used without arguments.
+.It Ic default-client-command Ar command
+Set the default command to run when tmux is called without a command.
+The default is
+.Ic new-session .
 .It Ic default-terminal Ar terminal
 Set the default terminal for new windows created in this session - the
 default value of the
@@ -5857,6 +5876,12 @@ with
 .Ql bar/
 throughout.
 .Pp
+Multiple modifiers may be separated with a semicolon (;) as in
+.Ql #{T;=10:status-left} ,
+which limits the resulting
+.Xr strftime 3 -expanded
+string to at most 10 characters.
+.Pp
 In addition, the last line of a shell command's output may be inserted using
 .Ql #() .
 For example,
@@ -5926,6 +5951,7 @@ The following variables are available, where appropriate:
 .It Li "command_list_name" Ta "" Ta "Command name if listing commands"
 .It Li "command_list_usage" Ta "" Ta "Command usage if listing commands"
 .It Li "config_files" Ta "" Ta "List of configuration files loaded"
+.It Li "cursor_blinking" Ta "" Ta "1 if the cursor is blinking"
 .It Li "copy_cursor_hyperlink" Ta "" Ta "Hyperlink under cursor in copy mode"
 .It Li "copy_cursor_line" Ta "" Ta "Line the cursor is on in copy mode"
 .It Li "copy_cursor_word" Ta "" Ta "Word under cursor in copy mode"
@@ -5933,7 +5959,10 @@ The following variables are available, where appropriate:
 .It Li "copy_cursor_y" Ta "" Ta "Cursor Y position in copy mode"
 .It Li "current_file" Ta "" Ta "Current configuration file"
 .It Li "cursor_character" Ta "" Ta "Character at cursor in pane"
+.It Li "cursor_colour" Ta "" Ta "Cursor colour in pane"
 .It Li "cursor_flag" Ta "" Ta "Pane cursor flag"
+.It Li "cursor_shape" Ta "" Ta "Cursor shape in pane"
+.It Li "cursor_very_visible" Ta "" Ta "1 if the cursor is in very visible mode"
 .It Li "cursor_x" Ta "" Ta "Cursor X position in pane"
 .It Li "cursor_y" Ta "" Ta "Cursor Y position in pane"
 .It Li "history_bytes" Ta "" Ta "Number of bytes in window history"
@@ -6744,7 +6773,7 @@ The following keys are available in menus:
 .El
 .Tg display
 .It Xo Ic display-message
-.Op Fl aIlNpv
+.Op Fl aCIlNpv
 .Op Fl c Ar target-client
 .Op Fl d Ar delay
 .Op Fl t Ar target-pane
@@ -6766,6 +6795,9 @@ is not given, the
 option is used; a delay of zero waits for a key press.
 .Ql N
 ignores key presses and closes only after the delay expires.
+If
+.Fl C
+is given, the pane will continue to be updated while the message is displayed.
 If
 .Fl l
 is given,

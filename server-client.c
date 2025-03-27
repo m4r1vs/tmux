@@ -56,11 +56,11 @@ static void	server_client_set_title(struct client *);
 static void	server_client_set_path(struct client *);
 static void	server_client_reset_state(struct client *);
 static void	server_client_update_latest(struct client *);
-
 static void	server_client_dispatch(struct imsg *, void *);
 static void	server_client_dispatch_command(struct client *, struct imsg *);
 static void	server_client_dispatch_identify(struct client *, struct imsg *);
 static void	server_client_dispatch_shell(struct client *);
+static void	server_client_report_theme(struct client *, enum client_theme);
 
 /* Compare client windows. */
 static int
@@ -152,10 +152,12 @@ server_client_clear_overlay(struct client *c)
 	c->overlay_draw = NULL;
 	c->overlay_key = NULL;
 	c->overlay_free = NULL;
+	c->overlay_resize = NULL;
 	c->overlay_data = NULL;
 
 	c->tty.flags &= ~(TTY_FREEZE|TTY_NOCURSOR);
-	window_update_focus(c->session->curw->window);
+	if (c->session != NULL)
+		window_update_focus(c->session->curw->window);
 	server_redraw_client(c);
 }
 
@@ -298,6 +300,7 @@ server_client_create(int fd)
 
 	c->tty.sx = 80;
 	c->tty.sy = 24;
+	c->theme = THEME_UNKNOWN;
 
 	status_init(c);
 	c->flags |= CLIENT_FOCUSED;
@@ -399,6 +402,7 @@ server_client_set_session(struct client *c, struct session *s)
 		recalculate_sizes();
 		window_update_focus(s->curw->window);
 		session_update_activity(s, NULL);
+		session_theme_changed(s);
 		gettimeofday(&s->last_attached_time, NULL);
 		s->curw->flags &= ~WINLINK_ALERTFLAGS;
 		s->curw->window->latest = c;
@@ -2241,13 +2245,13 @@ out:
 static int
 server_client_is_bracket_paste(struct client *c, key_code key)
 {
-	if (key == KEYC_PASTE_START) {
+	if ((key & KEYC_MASK_KEY) == KEYC_PASTE_START) {
 		c->flags |= CLIENT_BRACKETPASTING;
 		log_debug("%s: bracket paste on", c->name);
 		return (0);
 	}
 
-	if (key == KEYC_PASTE_END) {
+	if ((key & KEYC_MASK_KEY) == KEYC_PASTE_END) {
 		c->flags &= ~CLIENT_BRACKETPASTING;
 		log_debug("%s: bracket paste off", c->name);
 		return (0);
@@ -2380,6 +2384,16 @@ server_client_key_callback(struct cmdq_item *item, void *data)
 			goto out;
 		}
 		event->key = key;
+	}
+
+	/* Handle theme reporting keys. */
+	if (key == KEYC_REPORT_LIGHT_THEME) {
+		server_client_report_theme(c, THEME_LIGHT);
+		goto out;
+	}
+	if (key == KEYC_REPORT_DARK_THEME) {
+		server_client_report_theme(c, THEME_DARK);
+		goto out;
 	}
 
 	/* Find affected pane. */
@@ -2671,6 +2685,12 @@ server_client_loop(void)
 			wp->flags &= ~(PANE_REDRAW|PANE_REDRAWSCROLLBAR);
 		}
 		check_window_name(w);
+	}
+
+	/* Send theme updates. */
+	RB_FOREACH(w, windows, &windows) {
+		TAILQ_FOREACH(wp, &w->panes, entry)
+			window_pane_send_theme_update(wp);
 	}
 }
 
@@ -3428,6 +3448,7 @@ server_client_dispatch_command(struct client *c, struct imsg *imsg)
 	struct cmd_parse_result	 *pr;
 	struct args_value	 *values;
 	struct cmdq_item	 *new_item;
+	struct cmd_list		 *cmdlist;
 
 	if (c->flags & CLIENT_EXIT)
 		return;
@@ -3448,33 +3469,33 @@ server_client_dispatch_command(struct client *c, struct imsg *imsg)
 	}
 
 	if (argc == 0) {
-		argc = 1;
-		argv = xcalloc(1, sizeof *argv);
-		*argv = xstrdup("new-session");
+		cmdlist = cmd_list_copy(options_get_command(global_options,
+		    "default-client-command"), 0, NULL);
+	} else {
+		values = args_from_vector(argc, argv);
+		pr = cmd_parse_from_arguments(values, argc, NULL);
+		switch (pr->status) {
+		case CMD_PARSE_ERROR:
+			cause = pr->error;
+			goto error;
+		case CMD_PARSE_SUCCESS:
+			break;
+		}
+		args_free_values(values, argc);
+		free(values);
+		cmd_free_argv(argc, argv);
+		cmdlist = pr->cmdlist;
 	}
-
-	values = args_from_vector(argc, argv);
-	pr = cmd_parse_from_arguments(values, argc, NULL);
-	switch (pr->status) {
-	case CMD_PARSE_ERROR:
-		cause = pr->error;
-		goto error;
-	case CMD_PARSE_SUCCESS:
-		break;
-	}
-	args_free_values(values, argc);
-	free(values);
-	cmd_free_argv(argc, argv);
 
 	if ((c->flags & CLIENT_READONLY) &&
-	    !cmd_list_all_have(pr->cmdlist, CMD_READONLY))
+	    !cmd_list_all_have(cmdlist, CMD_READONLY))
 		new_item = cmdq_get_callback(server_client_read_only, NULL);
 	else
-		new_item = cmdq_get_command(pr->cmdlist, NULL);
+		new_item = cmdq_get_command(cmdlist, NULL);
 	cmdq_append(c, new_item);
 	cmdq_append(c, cmdq_get_callback(server_client_command_done, NULL));
 
-	cmd_list_free(pr->cmdlist);
+	cmd_list_free(cmdlist);
 	return;
 
 error:
@@ -3907,4 +3928,22 @@ server_client_print(struct client *c, int parse, struct evbuffer *evb)
 out:
 	if (!parse)
 		free(msg);
+}
+
+static void
+server_client_report_theme(struct client *c, enum client_theme theme)
+{
+	if (theme == THEME_LIGHT) {
+		c->theme = THEME_LIGHT;
+		notify_client("client-light-theme", c);
+	} else {
+		c->theme = THEME_DARK;
+		notify_client("client-dark-theme", c);
+	}
+
+	/*
+	 * Request foreground and background colour again. Don't forward 2031 to
+	 * panes until a response is received.
+	 */
+	tty_puts(&c->tty, "\033]10;?\033\\\033]11;?\033\\");
 }
