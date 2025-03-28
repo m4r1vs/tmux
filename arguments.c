@@ -324,9 +324,11 @@ args_parse(const struct args_parse *parse, struct args_value *values,
 		return (NULL);
 	}
 	if (parse->upper != -1 && args->count > (u_int)parse->upper) {
+		char *args_str = args_print(args);
 		xasprintf(cause,
-		    "too many arguments (need at most %u)",
-		    parse->upper);
+		    "too many arguments (need at most %u): %s",
+		    parse->upper, args_str);
+		free(args_str);
 		args_free(args);
 		return (NULL);
 	}
