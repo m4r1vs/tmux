@@ -87,6 +87,10 @@ screen_redraw_border_set(struct window *w, struct window_pane *wp,
 		gc->attr &= ~GRID_ATTR_CHARSET;
 		utf8_set(&gc->data, SIMPLE_BORDERS[cell_type]);
 		break;
+	case PANE_LINES_SPACES:
+		gc->attr &= ~GRID_ATTR_CHARSET;
+		utf8_set(&gc->data, ' ');
+		break;
 	default:
 		gc->attr |= GRID_ATTR_CHARSET;
 		utf8_set(&gc->data, CELL_BORDERS[cell_type]);
@@ -121,7 +125,12 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
 	u_int		 ex = wp->xoff + wp->sx, ey = wp->yoff + wp->sy;
 	int		 hsplit = 0, vsplit = 0, pane_status = ctx->pane_status;
 	int		 pane_scrollbars = ctx->pane_scrollbars, sb_w = 0;
-	int		 sb_pos = ctx->pane_scrollbars_pos;
+	int		 sb_pos;
+
+	if (pane_scrollbars != 0)
+		sb_pos = ctx->pane_scrollbars_pos;
+	else
+		sb_pos = 0;
 
 	/* Inside pane. */
 	if (px >= wp->xoff && px < ex && py >= wp->yoff && py < ey)
@@ -149,16 +158,24 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
 			if (wp->xoff - sb_w == 0 && px == wp->sx + sb_w)
 				if (!hsplit || (hsplit && py <= wp->sy / 2))
 					return (SCREEN_REDRAW_BORDER_RIGHT);
-			if (wp->xoff - sb_w != 0 && px == wp->xoff - sb_w - 1)
-				if (!hsplit || (hsplit && py > wp->sy / 2))
+			if (wp->xoff - sb_w != 0) {
+				if (px == wp->xoff - sb_w - 1 &&
+				    (!hsplit || (hsplit && py > wp->sy / 2)))
 					return (SCREEN_REDRAW_BORDER_LEFT);
-		} else { /* sb_pos == PANE_SCROLLBARS_RIGHT */
+				if (px == wp->xoff + wp->sx + sb_w - 1)
+					return (SCREEN_REDRAW_BORDER_RIGHT);
+			}
+		} else { /* sb_pos == PANE_SCROLLBARS_RIGHT or disabled */
 			if (wp->xoff == 0 && px == wp->sx + sb_w)
 				if (!hsplit || (hsplit && py <= wp->sy / 2))
 					return (SCREEN_REDRAW_BORDER_RIGHT);
-			if (wp->xoff != 0 && px == wp->xoff - 1)
-				if (!hsplit || (hsplit && py > wp->sy / 2))
+			if (wp->xoff != 0) {
+				if (px == wp->xoff - 1 &&
+				    (!hsplit || (hsplit && py > wp->sy / 2)))
 					return (SCREEN_REDRAW_BORDER_LEFT);
+				if (px == wp->xoff + wp->sx + sb_w)
+					return (SCREEN_REDRAW_BORDER_RIGHT);
+			}
 		}
 	}
 
@@ -180,9 +197,11 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
 		} else { /* sb_pos == PANE_SCROLLBARS_RIGHT */
 			if ((wp->xoff == 0 || px >= wp->xoff) &&
 			    (px <= ex || (sb_w != 0 && px < ex + sb_w))) {
-				if (wp->yoff != 0 && py == wp->yoff - 1)
+				if (pane_status != PANE_STATUS_BOTTOM &&
+				    wp->yoff != 0 &&
+				    py == wp->yoff - 1)
 					return (SCREEN_REDRAW_BORDER_TOP);
-				if (py == ey)
+				if (pane_status != PANE_STATUS_TOP && py == ey)
 					return (SCREEN_REDRAW_BORDER_BOTTOM);
 			}
 		}
@@ -363,7 +382,6 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, u_int px, u_int py,
 
 		/* Check if CELL_SCROLLBAR */
 		if (window_pane_show_scrollbar(wp, pane_scrollbars)) {
-
 			if (pane_status == PANE_STATUS_TOP)
 				line = wp->yoff - 1;
 			else
@@ -432,6 +450,7 @@ screen_redraw_make_pane_status(struct client *c, struct window_pane *wp,
 	struct grid_cell	 gc;
 	const char		*fmt;
 	struct format_tree	*ft;
+	struct style_line_entry	*sle = &wp->border_status_line;
 	char			*expanded;
 	int			 pane_status = rctx->pane_status, sb_w = 0;
 	int			 pane_scrollbars = rctx->pane_scrollbars;
@@ -476,11 +495,14 @@ screen_redraw_make_pane_status(struct client *c, struct window_pane *wp,
 	gc.attr &= ~GRID_ATTR_CHARSET;
 
 	screen_write_cursormove(&ctx, 0, 0, 0);
-	format_draw(&ctx, &gc, width, expanded, NULL, 0);
-	screen_write_stop(&ctx);
+	style_ranges_free(&sle->ranges);
+	format_draw(&ctx, &gc, width, expanded, &sle->ranges, 0);
 
-	free(expanded);
+	screen_write_stop(&ctx);
 	format_free(ft);
+
+	free(sle->expanded);
+	sle->expanded = expanded;
 
 	if (grid_compare(wp->status_screen.grid, old.grid) == 0) {
 		screen_free(&old);
@@ -714,6 +736,78 @@ screen_redraw_draw_borders_style(struct screen_redraw_ctx *ctx, u_int x,
 	return (&wp->border_gc);
 }
 
+/* Draw arrow indicator if enabled. */
+static void
+screen_redraw_draw_border_arrows(struct screen_redraw_ctx *ctx, u_int i,
+    u_int j, u_int cell_type, struct window_pane *wp,
+    struct window_pane *active, struct grid_cell *gc)
+{
+	struct client		*c = ctx->c;
+	struct session		*s = c->session;
+	struct window		*w = s->curw->window;
+	struct options		*oo = w->options;
+	u_int			 x = ctx->ox + i, y = ctx->oy + j;
+	int			 value, arrows = 0, border;
+
+	if (wp == NULL)
+		return;
+	if (i != wp->xoff + 1 && j != wp->yoff + 1)
+		return;
+
+	value = options_get_number(oo, "pane-border-indicators");
+	if (value != PANE_BORDER_ARROWS && value != PANE_BORDER_BOTH)
+		return;
+
+	border = screen_redraw_pane_border(ctx, active, x, y);
+	if (border == SCREEN_REDRAW_INSIDE)
+		return;
+
+	if (i == wp->xoff + 1) {
+		if (border == SCREEN_REDRAW_OUTSIDE) {
+			if (screen_redraw_two_panes(wp->window, 1)) {
+				if (active == TAILQ_FIRST(&w->panes))
+					border = SCREEN_REDRAW_BORDER_BOTTOM;
+				else
+					border = SCREEN_REDRAW_BORDER_TOP;
+				arrows = 1;
+			}
+		} else {
+			if (cell_type == CELL_LEFTRIGHT)
+				arrows = 1;
+			else if (cell_type == CELL_TOPJOIN &&
+			    border == SCREEN_REDRAW_BORDER_BOTTOM)
+				arrows = 1;
+			else if (cell_type == CELL_BOTTOMJOIN &&
+			    border == SCREEN_REDRAW_BORDER_TOP)
+				arrows = 1;
+		}
+	}
+	if (j == wp->yoff + 1) {
+		if (border == SCREEN_REDRAW_OUTSIDE) {
+			if (screen_redraw_two_panes(wp->window, 0)) {
+				if (active == TAILQ_FIRST(&w->panes))
+					border = SCREEN_REDRAW_BORDER_RIGHT;
+				else
+					border = SCREEN_REDRAW_BORDER_LEFT;
+				arrows = 1;
+			}
+		} else {
+			if (cell_type == CELL_TOPBOTTOM)
+				arrows = 1;
+			else if (cell_type == CELL_LEFTJOIN &&
+			    border == SCREEN_REDRAW_BORDER_RIGHT)
+				arrows = 1;
+			else if (cell_type == CELL_RIGHTJOIN &&
+			    border == SCREEN_REDRAW_BORDER_LEFT)
+				arrows = 1;
+		}
+	}
+	if (arrows) {
+		gc->attr |= GRID_ATTR_CHARSET;
+		utf8_set(&gc->data, BORDER_MARKERS[border]);
+	}
+}
+
 /* Draw a border cell. */
 static void
 screen_redraw_draw_borders_cell(struct screen_redraw_ctx *ctx, u_int i, u_int j)
@@ -727,13 +821,14 @@ screen_redraw_draw_borders_cell(struct screen_redraw_ctx *ctx, u_int i, u_int j)
 	struct window_pane	*wp, *active = server_client_get_pane(c);
 	struct grid_cell	 gc;
 	const struct grid_cell	*tmp;
-	struct overlay_ranges	 r;
-	u_int			 cell_type, x = ctx->ox + i, y = ctx->oy + j;
-	int			 arrows = 0, border, isolates;
+	u_int			 cell_type;
+	u_int			 x = ctx->ox + i, y = ctx->oy + j;
+	int			 isolates;
+	struct visible_ranges	*r;
 
 	if (c->overlay_check != NULL) {
-		c->overlay_check(c, c->overlay_data, x, y, 1, &r);
-		if (r.nx[0] + r.nx[1] == 0)
+		r = c->overlay_check(c, c->overlay_data, x, y, 1);
+		if (server_client_ranges_is_empty(r))
 			return;
 	}
 
@@ -777,32 +872,7 @@ screen_redraw_draw_borders_cell(struct screen_redraw_ctx *ctx, u_int i, u_int j)
 	if (isolates)
 		tty_puts(tty, END_ISOLATE);
 
-	switch (options_get_number(oo, "pane-border-indicators")) {
-	case PANE_BORDER_ARROWS:
-	case PANE_BORDER_BOTH:
-		arrows = 1;
-		break;
-	}
-
-	if (wp != NULL && arrows) {
-		border = screen_redraw_pane_border(ctx, active, x, y);
-		if (((i == wp->xoff + 1 &&
-		    (cell_type == CELL_LEFTRIGHT ||
-		    (cell_type == CELL_TOPJOIN &&
-		    border == SCREEN_REDRAW_BORDER_BOTTOM) ||
-		    (cell_type == CELL_BOTTOMJOIN &&
-		    border == SCREEN_REDRAW_BORDER_TOP))) ||
-		    (j == wp->yoff + 1 &&
-		    (cell_type == CELL_TOPBOTTOM ||
-		    (cell_type == CELL_LEFTJOIN &&
-		    border == SCREEN_REDRAW_BORDER_RIGHT) ||
-		    (cell_type == CELL_RIGHTJOIN &&
-		    border == SCREEN_REDRAW_BORDER_LEFT)))) &&
-		    screen_redraw_check_is(ctx, x, y, active)) {
-			gc.attr |= GRID_ATTR_CHARSET;
-			utf8_set(&gc.data, BORDER_MARKERS[border]);
-		}
-	}
+	screen_redraw_draw_border_arrows(ctx, i, j, cell_type, wp, active, &gc);
 
 	tty_cell(tty, &gc, &grid_default_cell, NULL, NULL);
 	if (isolates)
@@ -878,7 +948,12 @@ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
 	struct screen		*s = wp->screen;
 	struct colour_palette	*palette = &wp->palette;
 	struct grid_cell	 defaults;
-	u_int			 i, j, top, x, y, width;
+	struct visible_ranges	*r;
+	struct visible_range	*rr;
+	u_int			 i, j, k, top, x, y, width;
+
+	if (wp->base.mode & MODE_SYNC)
+		screen_write_stop_sync(wp);
 
 	log_debug("%s: %s @%u %%%u", __func__, c->name, w->id, wp->id);
 
@@ -920,7 +995,15 @@ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
 		    __func__, c->name, wp->id, i, j, x, y, width);
 
 		tty_default_colours(&defaults, wp);
-		tty_draw_line(tty, s, i, j, width, x, y, &defaults, palette);
+
+		r = tty_check_overlay_range(tty, x, y, width);
+		for (k = 0; k < r->used; k++) {
+			rr = &r->ranges[k];
+			if (rr->nx != 0) {
+				tty_draw_line(tty, s, rr->px - wp->xoff, j,
+				    rr->nx, rr->px, y, &defaults, palette);
+			}
+		}
 	}
 
 #ifdef ENABLE_SIXEL
@@ -1011,12 +1094,18 @@ screen_redraw_draw_scrollbar(struct screen_redraw_ctx *ctx,
 	int			 sx = ctx->sx, sy = ctx->sy, xoff = wp->xoff;
 	int			 yoff = wp->yoff;
 
-	/* Set up style for slider. */
+	if (ctx->statustop) {
+		sb_y += ctx->statuslines;
+		sy += ctx->statuslines;
+	}
+
 	gc = sb_style->gc;
 	memcpy(&slgc, &gc, sizeof slgc);
 	slgc.fg = gc.bg;
 	slgc.bg = gc.fg;
 
+	if (sb_x >= sx || sb_y >= sy)
+		return;
 	imax = sb_w + sb_pad;
 	if ((int)imax + sb_x > sx)
 		imax = sx - sb_x;

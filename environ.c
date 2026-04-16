@@ -57,6 +57,9 @@ environ_free(struct environ *env)
 {
 	struct environ_entry	*envent, *envent1;
 
+	if (env == NULL)
+		return;
+
 	RB_FOREACH_SAFE(envent, environ, env, envent1) {
 		RB_REMOVE(environ, env, envent);
 		free(envent->name);
@@ -262,6 +265,7 @@ environ_for_session(struct session *s, int no_TERM)
 		environ_set(env, "TERM", 0, "%s", value);
 		environ_set(env, "TERM_PROGRAM", 0, "%s", "tmux");
 		environ_set(env, "TERM_PROGRAM_VERSION", 0, "%s", getversion());
+		environ_set(env, "COLORTERM", 0, "truecolor");
 	}
 
 #ifdef HAVE_SYSTEMD

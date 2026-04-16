@@ -127,11 +127,11 @@ test_conditional_with_pane_in_mode "#{?pane_in_mode,{abc,xyz},bonus}" "{abc,bonu
 # invalid format: #{abc,xyz} is not a known variable name.
 #test_conditional_with_pane_in_mode "#{?pane_in_mode,#{abc,xyz},bonus}" "" "bonus"
 
-# Parenthesis (...) do not captura a comma, and "xyz)" is a false condition
+# Parenthesis (...) do not capture a comma, and "xyz)" is a false condition
 test_conditional_with_pane_in_mode "#{?pane_in_mode,(abc,xyz),bonus}" "(abc" ""
 test_conditional_with_pane_in_mode "#{?pane_in_mode,(abc#,xyz),bonus}" "(abc,xyz)" "bonus"
 
-# Brackets [...] do not captura a comma, and "xyz]" is a false condition
+# Brackets [...] do not capture a comma, and "xyz]" is a false condition
 test_conditional_with_pane_in_mode "#{?pane_in_mode,[abc,xyz],bonus}" "[abc" ""
 test_conditional_with_pane_in_mode "#{?pane_in_mode,[abc#,xyz],bonus}" "[abc,xyz]" "bonus"
 
@@ -172,6 +172,47 @@ test_conditional_with_session_name "#{?pane_in_mode,abc,#{?#{==:#{session_name},
 
 # Some fancy stackings
 test_conditional_with_pane_in_mode "#{?#{==:#{?pane_in_mode,#{session_name},#(echo Spring)},Summer},abc,xyz}" "abc" "xyz"
+
+
+
+# Tests for boolean expressions
+
+# "0" and the empty string are false, everything else is true.
+test_format "#{!!:0}" "0"
+test_format "#{!!:}" "0"
+test_format "#{!!:1}" "1"
+test_format "#{!!:2}" "1"
+test_format "#{!!:non-empty string}" "1"
+test_format "#{!!:-0}" "1"
+test_format "#{!!:0.0}" "1"
+
+# Logical operators
+test_format "#{!:0}" "1"
+test_format "#{!:1}" "0"
+
+test_format "#{&&:0}" "0"
+test_format "#{&&:1}" "1"
+test_format "#{&&:0,0}" "0"
+test_format "#{&&:0,1}" "0"
+test_format "#{&&:1,0}" "0"
+test_format "#{&&:1,1}" "1"
+test_format "#{&&:0,0,0}" "0"
+test_format "#{&&:0,1,1}" "0"
+test_format "#{&&:1,0,1}" "0"
+test_format "#{&&:1,1,0}" "0"
+test_format "#{&&:1,1,1}" "1"
+
+test_format "#{||:0}" "0"
+test_format "#{||:1}" "1"
+test_format "#{||:0,0}" "0"
+test_format "#{||:0,1}" "1"
+test_format "#{||:1,0}" "1"
+test_format "#{||:1,1}" "1"
+test_format "#{||:0,0,0}" "0"
+test_format "#{||:1,0,0}" "1"
+test_format "#{||:0,1,0}" "1"
+test_format "#{||:0,0,1}" "1"
+test_format "#{||:1,1,1}" "1"
 
 
 

@@ -49,6 +49,7 @@ format_is_type(struct format_range *fr, struct style *sy)
 	case STYLE_RANGE_NONE:
 	case STYLE_RANGE_LEFT:
 	case STYLE_RANGE_RIGHT:
+	case STYLE_RANGE_CONTROL:
 		return (1);
 	case STYLE_RANGE_PANE:
 	case STYLE_RANGE_WINDOW:
@@ -719,7 +720,7 @@ format_draw(struct screen_write_ctx *octx, const struct grid_cell *base,
 	int			 focus_start = -1, focus_end = -1;
 	int			 list_state = -1, fill = -1, even;
 	enum style_align	 list_align = STYLE_ALIGN_DEFAULT;
-	struct grid_cell	 gc, current_default;
+	struct grid_cell	 gc, current_default, base_default;
 	struct style		 sy, saved_sy;
 	struct utf8_data	*ud = &sy.gc.data;
 	const char		*cp, *end;
@@ -729,7 +730,9 @@ format_draw(struct screen_write_ctx *octx, const struct grid_cell *base,
 	struct format_ranges	 frs;
 	struct style_range	*sr;
 
+	memcpy(&base_default, base, sizeof base_default);
 	memcpy(&current_default, base, sizeof current_default);
+	base = &base_default;
 	style_set(&sy, &current_default);
 	TAILQ_INIT(&frs);
 	log_debug("%s: %s", __func__, expanded);
@@ -846,6 +849,12 @@ format_draw(struct screen_write_ctx *octx, const struct grid_cell *base,
 			sy.default_type = STYLE_DEFAULT_BASE;
 		} else if (sy.default_type == STYLE_DEFAULT_POP) {
 			memcpy(&current_default, base, sizeof current_default);
+			sy.default_type = STYLE_DEFAULT_BASE;
+		} else if (sy.default_type == STYLE_DEFAULT_SET) {
+			memcpy(&base_default, &saved_sy.gc,
+			    sizeof base_default);
+			memcpy(&current_default, &saved_sy.gc,
+			    sizeof current_default);
 			sy.default_type = STYLE_DEFAULT_BASE;
 		}
 
@@ -1057,6 +1066,10 @@ format_draw(struct screen_write_ctx *octx, const struct grid_cell *base,
 			log_debug("%s: range user|%u at %u-%u", __func__,
 			    sr->argument, sr->start, sr->end);
 			break;
+		case STYLE_RANGE_CONTROL:
+			log_debug("%s: range control|%u at %u-%u", __func__,
+			    sr->argument, sr->start, sr->end);
+			break;
 		}
 		format_free_range(&frs, fr);
 	}
@@ -1096,8 +1109,6 @@ format_width(const char *expanded)
 				more = utf8_append(&ud, *cp);
 			if (more == UTF8_DONE)
 				width += ud.width;
-			else
-				cp -= ud.have;
 		} else if (*cp > 0x1f && *cp < 0x7f) {
 			width++;
 			cp++;
@@ -1110,7 +1121,7 @@ format_width(const char *expanded)
 /*
  * Trim on the left, taking #[] into account.  Note, we copy the whole set of
  * unescaped #s, but only add their escaped size to width. This is because the
- * format_draw function will actually do the escaping when it runs
+ * format_draw function will actually do the escaping.
  */
 char *
 format_trim_left(const char *expanded, u_int limit)

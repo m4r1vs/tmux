@@ -1,6 +1,6 @@
 # configure.ac
 
-AC_INIT([tmux], next-3.6)
+AC_INIT([tmux], next-3.7)
 AC_PREREQ([2.60])
 
 AC_CONFIG_AUX_DIR(etc)
@@ -63,6 +63,15 @@ AC_ARG_ENABLE(
 	[case "x$VERSION" in xnext*) enable_debug=yes;; esac]
 )
 AM_CONDITIONAL(IS_DEBUG, test "x$enable_debug" = xyes)
+
+# Is this --enable-optimizations?
+AC_ARG_ENABLE(
+	optimizations,
+	AS_HELP_STRING(--enable-optimizations, enable optimization build flags),
+	,
+	enable_optimizations=yes
+)
+AM_CONDITIONAL(IS_OPTIMIZED, test "x$enable_optimizations" = xyes)
 
 # Is this a static build?
 AC_ARG_ENABLE(
@@ -219,7 +228,7 @@ AC_SEARCH_LIBS(clock_gettime, rt)
 # musl does not set optarg to NULL for flags without arguments (although it is
 # not required to, but it is helpful) 3) there are probably other weird
 # implementations.
-AC_LIBOBJ(getopt)
+AC_LIBOBJ(getopt_long)
 
 # Look for libevent. Try libevent_core or libevent with pkg-config first then
 # look for the library.
@@ -988,16 +997,15 @@ AM_CONDITIONAL(IS_UNKNOWN, test "x$PLATFORM" = xunknown)
 
 # Set the default lock command
 DEFAULT_LOCK_CMD="lock -np"
-AC_MSG_CHECKING(lock-command)
 if test "x$PLATFORM" = xlinux; then
 	AC_CHECK_PROG(found_vlock, vlock, yes, no)
 	if test "x$found_vlock" = xyes; then
 		DEFAULT_LOCK_CMD="vlock"
 	fi
 fi
+AC_MSG_CHECKING(lock-command)
 AC_MSG_RESULT($DEFAULT_LOCK_CMD)
 AC_SUBST(DEFAULT_LOCK_CMD)
-
 
 # Save our CFLAGS/CPPFLAGS/LDFLAGS for the Makefile and restore the old user
 # variables.

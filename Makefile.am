@@ -20,17 +20,23 @@ LDADD = $(LIBOBJS)
 
 # Set flags for gcc.
 if IS_GCC
-AM_CFLAGS += -std=gnu99 -O2
+AM_CFLAGS += -std=gnu99
+if IS_OPTIMIZED
+AM_CFLAGS += -O2
+else
+AM_CFLAGS += -O0
+endif
 if IS_DEBUG
 AM_CFLAGS += -g
-AM_CFLAGS += -Wno-long-long -Wall -W -Wformat=2
+AM_CFLAGS += -Wno-long-long -Wall -W -Wformat=2 -Wno-use-after-free
 AM_CFLAGS += -Wmissing-prototypes -Wstrict-prototypes -Wmissing-declarations
 AM_CFLAGS += -Wwrite-strings -Wshadow -Wpointer-arith -Wsign-compare
-AM_CFLAGS += -Wundef -Wbad-function-cast -Winline -Wcast-align
+AM_CFLAGS += -Wundef -Wbad-function-cast -Winline -Wno-cast-align
 AM_CFLAGS += -Wdeclaration-after-statement -Wno-pointer-sign -Wno-attributes
-AM_CFLAGS += -Wno-unused-result -Wno-format-y2k
+AM_CFLAGS += -Wno-unused-result -Wno-format-y2k -Wno-unknown-warning-option
+AM_CFLAGS += -Wno-maybe-uninitialized
 if IS_DARWIN
-AM_CFLAGS += -Wno-deprecated-declarations -Wno-cast-align -Wno-macro-redefined
+AM_CFLAGS += -Wno-deprecated-declarations -Wno-macro-redefined
 endif
 AM_CPPFLAGS += -DDEBUG
 endif
@@ -100,6 +106,7 @@ dist_tmux_SOURCES = \
 	cmd-kill-window.c \
 	cmd-list-buffers.c \
 	cmd-list-clients.c \
+	cmd-list-commands.c \
 	cmd-list-keys.c \
 	cmd-list-panes.c \
 	cmd-list-sessions.c \
@@ -183,6 +190,7 @@ dist_tmux_SOURCES = \
 	server-fn.c \
 	server.c \
 	session.c \
+	sort.c \
 	spawn.c \
 	status.c \
 	style.c \
@@ -190,6 +198,7 @@ dist_tmux_SOURCES = \
 	tmux.h \
 	tmux-protocol.h \
 	tty-acs.c \
+	tty-draw.c \
 	tty-features.c \
 	tty-keys.c \
 	tty-term.c \
@@ -228,9 +237,19 @@ dist_tmux_SOURCES += image.c image-sixel.c
 endif
 
 if NEED_FUZZING
-check_PROGRAMS = fuzz/input-fuzzer
+check_PROGRAMS = \
+	fuzz/input-fuzzer \
+	fuzz/cmd-parse-fuzzer \
+	fuzz/format-fuzzer \
+	fuzz/style-fuzzer
 fuzz_input_fuzzer_LDFLAGS = $(FUZZING_LIBS)
 fuzz_input_fuzzer_LDADD = $(LDADD) $(tmux_OBJECTS)
+fuzz_cmd_parse_fuzzer_LDFLAGS = $(FUZZING_LIBS)
+fuzz_cmd_parse_fuzzer_LDADD = $(LDADD) $(tmux_OBJECTS)
+fuzz_format_fuzzer_LDFLAGS = $(FUZZING_LIBS)
+fuzz_format_fuzzer_LDADD = $(LDADD) $(tmux_OBJECTS)
+fuzz_style_fuzzer_LDFLAGS = $(FUZZING_LIBS)
+fuzz_style_fuzzer_LDADD = $(LDADD) $(tmux_OBJECTS)
 endif
 
 # Install tmux.1 in the right format.

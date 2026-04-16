@@ -328,6 +328,9 @@ window_create(u_int sx, u_int sy, u_int xpixel, u_int ypixel)
 	RB_INSERT(windows, &windows, w);
 
 	window_set_fill_character(w);
+
+	if (gettimeofday(&w->creation_time, NULL) != 0)
+		fatal("gettimeofday failed");
 	window_update_activity(w);
 
 	log_debug("%s: @%u create %ux%u (%ux%u)", __func__, w->id, sx, sy,
@@ -593,16 +596,24 @@ struct window_pane *
 window_get_active_at(struct window *w, u_int x, u_int y)
 {
 	struct window_pane	*wp;
-	u_int			 xoff, yoff, sx, sy;
+	int			 pane_status, xoff, yoff;
+	u_int			 sx, sy;
+
+	pane_status = options_get_number(w->options, "pane-border-status");
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
 		if (!window_pane_visible(wp))
 			continue;
 		window_pane_full_size_offset(wp, &xoff, &yoff, &sx, &sy);
-		if (x < xoff || x > xoff + sx)
+		if ((int)x < xoff || x > xoff + sx)
 			continue;
-		if (y < yoff || y > yoff + sy)
-			continue;
+		if (pane_status == PANE_STATUS_TOP) {
+			if ((int)y <= yoff - 2 || y > yoff + sy - 1)
+				continue;
+		} else {
+			if ((int)y < yoff || y > yoff + sy)
+				continue;
+		}
 		return (wp);
 	}
 	return (NULL);
@@ -663,6 +674,7 @@ window_zoom(struct window_pane *wp)
 
 	if (w->active != wp)
 		window_set_active_pane(w, wp, 1);
+	wp->flags |= PANE_ZOOMED;
 
 	TAILQ_FOREACH(wp1, &w->panes, entry) {
 		wp1->saved_layout_cell = wp1->layout_cell;
@@ -693,6 +705,7 @@ window_unzoom(struct window *w, int notify)
 	TAILQ_FOREACH(wp, &w->panes, entry) {
 		wp->layout_cell = wp->saved_layout_cell;
 		wp->saved_layout_cell = NULL;
+		wp->flags ^= PANE_ZOOMED;
 	}
 	layout_fix_panes(w, NULL);
 
@@ -876,9 +889,8 @@ window_printable_flags(struct winlink *wl, int escape)
 {
 	struct session	*s = wl->session;
 	static char	 flags[32];
-	int		 pos;
+	u_int		 pos = 0;
 
-	pos = 0;
 	if (wl->flags & WINLINK_ACTIVITY) {
 		flags[pos++] = '#';
 		if (escape)
@@ -896,6 +908,25 @@ window_printable_flags(struct winlink *wl, int escape)
 		flags[pos++] = 'M';
 	if (wl->window->flags & WINDOW_ZOOMED)
 		flags[pos++] = 'Z';
+	flags[pos] = '\0';
+	return (flags);
+}
+
+const char *
+window_pane_printable_flags(struct window_pane *wp)
+{
+	struct window	*w = wp->window;
+	static char	 flags[32];
+	u_int		 pos = 0;
+
+	if (wp == w->active)
+		flags[pos++] = '*';
+	if (wp == TAILQ_FIRST(&w->last_panes))
+		flags[pos++] = '-';
+	if (wp->flags & PANE_ZOOMED)
+		flags[pos++] = 'Z';
+	if (wp->flags & PANE_FLOATING)
+		flags[pos++] = 'F';
 	flags[pos] = '\0';
 	return (flags);
 }
@@ -933,7 +964,7 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	wp = xcalloc(1, sizeof *wp);
 	wp->window = w;
 	wp->options = options_create(w->options);
-	wp->flags = (PANE_STYLECHANGED|PANE_THEMECHANGED);
+	wp->flags = PANE_STYLECHANGED;
 
 	wp->id = next_window_pane_id++;
 	RB_INSERT(window_pane_tree, &all_window_panes, wp);
@@ -963,6 +994,7 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	window_pane_default_cursor(wp);
 
 	screen_init(&wp->status_screen, 1, 1, 0);
+	style_ranges_init(&wp->border_status_line.ranges);
 
 	if (gethostname(host, sizeof host) == 0)
 		screen_set_title(&wp->base, host);
@@ -982,6 +1014,7 @@ window_pane_destroy(struct window_pane *wp)
 	if (wp->fd != -1) {
 #ifdef HAVE_UTEMPTER
 		utempter_remove_record(wp->fd);
+		kill(getpid(), SIGCHLD);
 #endif
 		bufferevent_free(wp->event);
 		close(wp->fd);
@@ -1000,6 +1033,8 @@ window_pane_destroy(struct window_pane *wp)
 
 	if (event_initialized(&wp->resize_timer))
 		event_del(&wp->resize_timer);
+	if (event_initialized(&wp->sync_timer))
+		event_del(&wp->sync_timer);
 	TAILQ_FOREACH_SAFE(r, &wp->resize_queue, entry, r1) {
 		TAILQ_REMOVE(&wp->resize_queue, r, entry);
 		free(r);
@@ -1012,6 +1047,7 @@ window_pane_destroy(struct window_pane *wp)
 	free(wp->shell);
 	cmd_free_argv(wp->argc, wp->argv);
 	colour_palette_free(&wp->palette);
+	style_ranges_free(&wp->border_status_line.ranges);
 	free(wp);
 }
 
@@ -1065,7 +1101,7 @@ window_pane_set_event(struct window_pane *wp)
 	    NULL, window_pane_error_callback, wp);
 	if (wp->event == NULL)
 		fatalx("out of memory");
-	wp->ictx = input_init(wp, wp->event, &wp->palette);
+	wp->ictx = input_init(wp, wp->event, &wp->palette, NULL);
 
 	bufferevent_enable(wp->event, EV_READ|EV_WRITE);
 }
@@ -1078,6 +1114,8 @@ window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 
 	if (sx == wp->sx && sy == wp->sy)
 		return;
+
+	screen_write_stop_sync(wp);
 
 	r = xmalloc(sizeof *r);
 	r->sx = sx;
@@ -1779,7 +1817,7 @@ window_pane_mode(struct window_pane *wp)
 int
 window_pane_show_scrollbar(struct window_pane *wp, int sb_option)
 {
-	if (SCREEN_IS_ALTERNATE(wp->screen))
+	if (SCREEN_IS_ALTERNATE(&wp->base))
 		return (0);
 	if (sb_option == PANE_SCROLLBARS_ALWAYS ||
 	    (sb_option == PANE_SCROLLBARS_MODAL &&
@@ -1932,21 +1970,60 @@ window_pane_get_theme(struct window_pane *wp)
 void
 window_pane_send_theme_update(struct window_pane *wp)
 {
+	enum client_theme	theme;
+
+	if (wp == NULL || window_pane_exited(wp))
+		return;
 	if (~wp->flags & PANE_THEMECHANGED)
 		return;
 	if (~wp->screen->mode & MODE_THEME_UPDATES)
 		return;
 
-	switch (window_pane_get_theme(wp)) {
+	theme = window_pane_get_theme(wp);
+	if (theme == wp->last_theme)
+		return;
+	wp->last_theme = theme;
+	wp->flags &= ~PANE_THEMECHANGED;
+
+	switch (theme) {
 	case THEME_LIGHT:
-		input_key_pane(wp, KEYC_REPORT_LIGHT_THEME, NULL);
+		log_debug("%s: %%%u light theme", __func__, wp->id);
+		bufferevent_write(wp->event, "\033[?997;2n", 9);
 		break;
 	case THEME_DARK:
-		input_key_pane(wp, KEYC_REPORT_DARK_THEME, NULL);
+		log_debug("%s: %%%u dark theme", __func__, wp->id);
+		bufferevent_write(wp->event, "\033[?997;1n", 9);
 		break;
 	case THEME_UNKNOWN:
+		log_debug("%s: %%%u unknown theme", __func__, wp->id);
 		break;
 	}
+}
 
-	wp->flags &= ~PANE_THEMECHANGED;
+struct style_range *
+window_pane_border_status_get_range(struct window_pane *wp, u_int x, u_int y)
+{
+	struct style_ranges	*srs;
+	struct window		*w = wp->window;
+	struct options		*wo = w->options;
+	u_int			 line;
+	int			 pane_status;
+
+	if (wp == NULL)
+		return (NULL);
+	srs = &wp->border_status_line.ranges;
+
+	pane_status = options_get_number(wo, "pane-border-status");
+	if (pane_status == PANE_STATUS_TOP)
+		line = wp->yoff - 1;
+	else if (pane_status == PANE_STATUS_BOTTOM)
+		line = wp->yoff + wp->sy;
+	if (pane_status == PANE_STATUS_OFF || line != y)
+		return (NULL);
+
+	/*
+	 * The border formats start 2 off but that isn't reflected in
+	 * the stored bounds of the range.
+	 */
+	return (style_ranges_get_range(srs, x - wp->xoff - 2));
 }

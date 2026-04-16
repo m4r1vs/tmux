@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -95,7 +96,9 @@ server_redraw_window(struct window *w)
 	struct client	*c;
 
 	TAILQ_FOREACH(c, &clients, entry) {
-		if (c->session != NULL && c->session->curw->window == w)
+		if (c->session != NULL &&
+		    c->session->curw != NULL &&
+		    c->session->curw->window == w)
 			server_redraw_client(c);
 	}
 }
@@ -106,7 +109,9 @@ server_redraw_window_borders(struct window *w)
 	struct client	*c;
 
 	TAILQ_FOREACH(c, &clients, entry) {
-		if (c->session != NULL && c->session->curw->window == w)
+		if (c->session != NULL &&
+		    c->session->curw != NULL &&
+		    c->session->curw->window == w)
 			c->flags |= CLIENT_REDRAWBORDERS;
 	}
 }
@@ -287,6 +292,8 @@ server_link_window(struct session *src, struct winlink *srcwl,
 	if (dstwl == NULL)
 		return (-1);
 
+	if (marked_pane.wl == srcwl)
+		marked_pane.wl = dstwl;
 	if (selectflag)
 		session_select(dst, dstwl->idx);
 	server_redraw_session_group(dst);
@@ -318,6 +325,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 	if (wp->fd != -1) {
 #ifdef HAVE_UTEMPTER
 		utempter_remove_record(wp->fd);
+		kill(getpid(), SIGCHLD);
 #endif
 		bufferevent_free(wp->event);
 		wp->event = NULL;
@@ -336,6 +344,7 @@ server_destroy_pane(struct window_pane *wp, int notify)
 			break;
 		/* FALLTHROUGH */
 	case 1:
+	case 3:
 		if (wp->flags & PANE_STATUSDRAWN)
 			return;
 		wp->flags |= PANE_STATUSDRAWN;
@@ -402,7 +411,7 @@ server_find_session(struct session *s,
 	struct session *s_loop, *s_out = NULL;
 
 	RB_FOREACH(s_loop, sessions, &sessions) {
-		if (s_loop != s && (s_out == NULL || f(s_loop, s_out)))
+		if (s_loop != s && f(s_loop, s_out))
 			s_out = s_loop;
 	}
 	return (s_out);
@@ -411,6 +420,8 @@ server_find_session(struct session *s,
 static int
 server_newer_session(struct session *s_loop, struct session *s_out)
 {
+	if (s_out == NULL)
+		return (1);
 	return (timercmp(&s_loop->activity_time, &s_out->activity_time, >));
 }
 
@@ -426,7 +437,7 @@ void
 server_destroy_session(struct session *s)
 {
 	struct client	*c;
-	struct session	*s_new = NULL, *cs_new, *use_s;
+	struct session	*s_new = NULL, *cs_new = NULL, *use_s;
 	int		 detach_on_destroy;
 
 	detach_on_destroy = options_get_number(s->options, "detach-on-destroy");
@@ -435,9 +446,9 @@ server_destroy_session(struct session *s)
 	else if (detach_on_destroy == 2)
 		s_new = server_find_session(s, server_newer_detached_session);
 	else if (detach_on_destroy == 3)
-		s_new = session_previous_session(s);
+		s_new = session_previous_session(s, NULL);
 	else if (detach_on_destroy == 4)
-		s_new = session_next_session(s);
+		s_new = session_next_session(s, NULL);
 
 	/*
 	 * If no suitable new session was found above, then look for any

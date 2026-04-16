@@ -388,7 +388,7 @@ int		 clock_gettime(int, struct timespec *);
 /* base64.c */
 #undef b64_ntop
 #undef b64_pton
-int		 b64_ntop(const char *, size_t, char *, size_t);
+int		 b64_ntop(const u_char *, size_t, char *, size_t);
 int		 b64_pton(const char *, u_char *, size_t);
 #endif
 
@@ -466,11 +466,11 @@ int		 utf8proc_wctomb(char *, wchar_t);
 #endif
 
 /* getopt.c */
-extern int	BSDopterr;
-extern int	BSDoptind;
-extern int	BSDoptopt;
-extern int	BSDoptreset;
-extern char    *BSDoptarg;
+extern int	 BSDopterr;
+extern int	 BSDoptind;
+extern int	 BSDoptopt;
+extern int	 BSDoptreset;
+extern char	*BSDoptarg;
 int	BSDgetopt(int, char *const *, const char *);
 #define getopt(ac, av, o)  BSDgetopt(ac, av, o)
 #define opterr             BSDopterr

@@ -36,7 +36,7 @@ static const char *options_table_mode_keys_list[] = {
 	"emacs", "vi", NULL
 };
 static const char *options_table_clock_mode_style_list[] = {
-	"12", "24", NULL
+	"12", "24", "12-with-seconds", "24-with-seconds", NULL
 };
 static const char *options_table_status_list[] = {
 	"off", "on", "2", "3", "4", "5", NULL
@@ -76,7 +76,7 @@ static const char *options_table_pane_border_indicators_list[] = {
 	"off", "colour", "arrows", "both", NULL
 };
 static const char *options_table_pane_border_lines_list[] = {
-	"single", "double", "heavy", "simple", "number", NULL
+	"single", "double", "heavy", "simple", "number", "spaces", NULL
 };
 static const char *options_table_popup_border_lines_list[] = {
 	"single", "double", "heavy", "simple", "rounded", "padded", "none", NULL
@@ -84,11 +84,14 @@ static const char *options_table_popup_border_lines_list[] = {
 static const char *options_table_set_clipboard_list[] = {
 	"off", "external", "on", NULL
 };
+static const char *options_table_get_clipboard_list[] = {
+	"off", "buffer", "request", "both", NULL
+};
 static const char *options_table_window_size_list[] = {
 	"largest", "smallest", "manual", "latest", NULL
 };
 static const char *options_table_remain_on_exit_list[] = {
-	"off", "on", "failed", NULL
+	"off", "on", "failed", "key", NULL
 };
 static const char *options_table_destroy_unattached_list[] = {
 	"off", "on", "keep-last", "keep-group", NULL
@@ -138,7 +141,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-format}" \
 		"#[pop-default]" \
 		"#[norange default]" \
-		"#{?window_end_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{E:window-status-separator}}" \
 	"," \
 		"#[range=window|#{window_index} list=focus " \
 			"#{?#{!=:#{E:window-status-current-style},default}," \
@@ -165,7 +168,7 @@ static const char *options_table_allow_passthrough_list[] = {
 		"#{T:window-status-current-format}" \
 		"#[pop-default]" \
 		"#[norange list=on default]" \
-		"#{?window_end_flag,,#{window-status-separator}}" \
+		"#{?loop_last_flag,,#{E:window-status-separator}}" \
 	"}" \
 	"#[nolist align=right range=right #{E:status-right-style}]" \
 	"#[push-default]" \
@@ -173,10 +176,60 @@ static const char *options_table_allow_passthrough_list[] = {
 	"#[pop-default]" \
 	"#[norange default]"
 #define OPTIONS_TABLE_STATUS_FORMAT2 \
-	"#[align=centre]#{P:#{?pane_active,#[reverse],}" \
-	"#{pane_index}[#{pane_width}x#{pane_height}]#[default] }"
+	"#[align=left]#{R: ,#{n:#{session_name}}}P: " \
+	"#[norange default]" \
+	"#[list=on align=#{status-justify}]" \
+	"#[list=left-marker]<#[list=right-marker]>#[list=on]" \
+	"#{P:" \
+		"#[range=pane|#{pane_id} " \
+			"#{E:pane-status-style}" \
+		"]" \
+		"#[push-default]" \
+		"#P[#{pane_width}x#{pane_height}]" \
+		"#[pop-default]" \
+		"#[norange list=on default]  " \
+	"," \
+		"#[range=pane|#{pane_id} list=focus " \
+			"#{?#{!=:#{E:pane-status-current-style},default}," \
+				"#{E:pane-status-current-style}," \
+				"#{E:pane-status-style}" \
+			"}" \
+		"]" \
+		"#[push-default]" \
+		"#P[#{pane_width}x#{pane_height}]*" \
+		"#[pop-default]" \
+		"#[norange list=on default] " \
+	"}"
+#define OPTIONS_TABLE_STATUS_FORMAT3 \
+	"#[align=left]#{R: ,#{n:#{session_name}}}S: " \
+	"#[norange default]" \
+	"#[list=on align=#{status-justify}]" \
+	"#[list=left-marker]<#[list=right-marker]>#[list=on]" \
+	"#{S:" \
+		"#[range=session|#{session_id} " \
+			"#{E:session-status-style}" \
+		"]" \
+		"#[push-default]" \
+		"#S#{session_alert}" \
+		"#[pop-default]" \
+		"#[norange list=on default]  " \
+	"," \
+		"#[range=session|#{session_id} list=focus " \
+			"#{?#{!=:#{E:session-status-current-style},default}," \
+					"#{E:session-status-current-style}," \
+					"#{E:session-status-style}" \
+			"}" \
+		"]" \
+		"#[push-default]" \
+		"#S*#{session_alert}" \
+		"#[pop-default]" \
+		"#[norange list=on default] " \
+	"}"
 static const char *options_table_status_format_default[] = {
-	OPTIONS_TABLE_STATUS_FORMAT1, OPTIONS_TABLE_STATUS_FORMAT2, NULL
+	OPTIONS_TABLE_STATUS_FORMAT1,
+	OPTIONS_TABLE_STATUS_FORMAT2,
+	OPTIONS_TABLE_STATUS_FORMAT3,
+	NULL
 };
 
 /* Helpers for hook options. */
@@ -355,6 +408,18 @@ const struct options_table_entry options_table[] = {
 	  .text = "Whether to send focus events to applications."
 	},
 
+	{ .name = "get-clipboard",
+	  .type = OPTIONS_TABLE_CHOICE,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .choices = options_table_get_clipboard_list,
+	  .default_num = 1,
+	  .text = "When an application requests the clipboard, whether to "
+		  "ignore the request ('off'); respond with the newest buffer "
+		  "('buffer'); request the clipboard from the most recently "
+		  "used terminal ('request'); or to request the clipboard, "
+		  "create a buffer, and send it to the application ('both')."
+	},
+
 	{ .name = "history-file",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SERVER,
@@ -369,7 +434,7 @@ const struct options_table_entry options_table[] = {
 	  .minimum = INPUT_BUF_DEFAULT_SIZE,
 	  .maximum = UINT_MAX,
 	  .default_num = INPUT_BUF_DEFAULT_SIZE,
-	  .text = "Number of byte accpted in a single input before dropping."
+	  .text = "Number of bytes accepted in a single input before dropping."
 	},
 
 	{ .name = "menu-style",
@@ -405,7 +470,7 @@ const struct options_table_entry options_table[] = {
 	  .choices = options_table_popup_border_lines_list,
 	  .default_num = BOX_LINES_SINGLE,
 	  .text = "Type of characters used to draw menu border lines. Some of "
-	          "these are only supported on terminals with UTF-8 support."
+		  "these are only supported on terminals with UTF-8 support."
 	},
 
 	{ .name = "message-limit",
@@ -425,7 +490,7 @@ const struct options_table_entry options_table[] = {
 	  .default_num = 0,
 	  .unit = "milliseconds",
 	  .text = "The timeout for the prefix key if no subsequent key is "
-	          "pressed. Zero means disabled."
+		  "pressed. Zero means disabled."
 	},
 
 	{ .name = "prompt-history-limit",
@@ -462,7 +527,7 @@ const struct options_table_entry options_table[] = {
 	  .flags = OPTIONS_TABLE_IS_ARRAY,
 	  .default_str = "xterm*:clipboard:ccolour:cstyle:focus:title,"
 			 "screen*:title,"
-	                 "rxvt*:ignorefkeys",
+			 "rxvt*:ignorefkeys",
 	  .separator = ",",
 	  .text = "List of terminal features, used if they cannot be "
 		  "automatically detected."
@@ -477,6 +542,14 @@ const struct options_table_entry options_table[] = {
 	  .text = "User key assignments. "
 		  "Each sequence in the list is translated into a key: "
 		  "'User0', 'User1' and so on."
+	},
+
+	{ .name = "variation-selector-always-wide",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SERVER,
+	  .default_num = 1,
+	  .text = "If the Unicode VS16 codepoint should always be treated as a "
+		  "wide character."
 	},
 
 	/* Session options. */
@@ -591,6 +664,13 @@ const struct options_table_entry options_table[] = {
 	  .text = "Time for which status line messages should appear."
 	},
 
+	{ .name = "focus-follows-mouse",
+	  .type = OPTIONS_TABLE_FLAG,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_num = 0,
+	  .text = "Whether moving the mouse into a pane selects it."
+	},
+
 	{ .name = "history-limit",
 	  .type = OPTIONS_TABLE_NUMBER,
 	  .scope = OPTIONS_TABLE_SESSION,
@@ -611,8 +691,8 @@ const struct options_table_entry options_table[] = {
 	  .default_num = 0,
 	  .unit = "milliseconds",
 	  .text = "Time to wait for a key binding to repeat the first time the "
-	          "key is pressed, if it is bound with the '-r' flag. "
-	          "Subsequent presses use the 'repeat-time' option."
+		  "key is pressed, if it is bound with the '-r' flag. "
+		  "Subsequent presses use the 'repeat-time' option."
 	},
 
 	{ .name = "key-table",
@@ -643,11 +723,22 @@ const struct options_table_entry options_table[] = {
 	{ .name = "message-command-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_str = "bg=black,fg=yellow",
+	  .default_str = "bg=black,fg=yellow,fill=black",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of the command prompt when in command mode, if "
 		  "'mode-keys' is set to 'vi'."
+	},
+
+	{ .name = "message-format",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .default_str = "#[#{?#{command_prompt},"
+		  "#{E:message-command-style},"
+		  "#{E:message-style}}]"
+		  "#{message}",
+	  .text = "Format string for the prompt and message area. "
+		  "The '#{message}' placeholder is replaced with the content."
 	},
 
 	{ .name = "message-line",
@@ -661,10 +752,13 @@ const struct options_table_entry options_table[] = {
 	{ .name = "message-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_str = "bg=yellow,fg=black",
+	  .default_str = "bg=yellow,fg=black,fill=yellow",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
-	  .text = "Style of messages and the command prompt."
+	  .text = "Style of messages and the command prompt. "
+		  "A 'fill' attribute controls background clearing and "
+		  "a 'width' attribute (fixed or percentage) constrains "
+		  "the prompt area width."
 	},
 
 	{ .name = "mouse",
@@ -863,10 +957,29 @@ const struct options_table_entry options_table[] = {
 	  .text = "Style of the status line."
 	},
 
+	{ .name = "pane-status-current-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of the current pane in the status line."
+	},
+
+	{ .name = "pane-status-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of panes in the status line, except the current "
+		  "pane."
+	},
+
 	{ .name = "prompt-cursor-colour",
 	  .type = OPTIONS_TABLE_COLOUR,
 	  .scope = OPTIONS_TABLE_SESSION,
-	  .default_num = 6,
+	  .default_num = -1,
 	  .text = "Colour of the cursor when in the command prompt."
 	},
 
@@ -878,12 +991,41 @@ const struct options_table_entry options_table[] = {
 	  .text = "Style of the cursor when in the command prompt."
 	},
 
+	{ .name = "prompt-command-cursor-style",
+	  .type = OPTIONS_TABLE_CHOICE,
+	  .scope = OPTIONS_TABLE_SESSION,
+	  .choices = options_table_cursor_style_list,
+	  .default_num = 0,
+	  .text = "Style of the cursor in the command prompt when in command "
+		  "mode, if 'status-keys' is set to 'vi'."
+	},
+
+	{ .name = "session-status-current-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of the current session in the status line."
+	},
+
+	{ .name = "session-status-style",
+	  .type = OPTIONS_TABLE_STRING,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .default_str = "default",
+	  .flags = OPTIONS_TABLE_IS_STYLE,
+	  .separator = ",",
+	  .text = "Style of sessions in the status line, except the current "
+		  "session."
+	},
+
 	{ .name = "update-environment",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_SESSION,
 	  .flags = OPTIONS_TABLE_IS_ARRAY,
 	  .default_str = "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK "
-			 "SSH_AGENT_PID SSH_CONNECTION WINDOWID XAUTHORITY",
+			 "SSH_AGENT_PID SSH_CONNECTION WAYLAND_DISPLAY "
+			 "WINDOWID XAUTHORITY",
 	  .text = "List of environment variables to update in the session "
 		  "environment when a client is attached."
 	},
@@ -1033,18 +1175,18 @@ const struct options_table_entry options_table[] = {
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "#[align=right]"
-	                 "#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}"
-	                 "[#{scroll_position}/#{history_size}]"
-	                 "#{?search_timed_out, (timed out),"
-	                 "#{?search_count, (#{search_count}"
-	                 "#{?search_count_partial,+,} results),}}",
+			 "#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}"
+			 "[#{scroll_position}/#{history_size}]"
+			 "#{?search_timed_out, (timed out),"
+			 "#{?search_count, (#{search_count}"
+			 "#{?search_count_partial,+,} results),}}",
 	  .text = "Format of the position indicator in copy mode."
 	},
 
 	{ .name = "copy-mode-position-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "#{mode-style}",
+	  .default_str = "#{E:mode-style}",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of position indicator in copy mode."
@@ -1053,7 +1195,7 @@ const struct options_table_entry options_table[] = {
 	{ .name = "copy-mode-selection-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
-	  .default_str = "#{mode-style}",
+	  .default_str = "#{E:mode-style}",
 	  .flags = OPTIONS_TABLE_IS_STYLE,
 	  .separator = ",",
 	  .text = "Style of selection in copy mode."
@@ -1094,7 +1236,7 @@ const struct options_table_entry options_table[] = {
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
 	  .flags = OPTIONS_TABLE_IS_STYLE,
-	  .default_str = "bg=yellow,fg=black",
+	  .default_str = "noattr,bg=yellow,fg=black",
 	  .separator = ",",
 	  .text = "Style of indicators and highlighting in modes."
 	},
@@ -1234,7 +1376,7 @@ const struct options_table_entry options_table[] = {
 	  .text = "Pane scrollbar position."
 	},
 
-        { .name = "popup-style",
+	{ .name = "popup-style",
 	  .type = OPTIONS_TABLE_STRING,
 	  .scope = OPTIONS_TABLE_WINDOW,
 	  .default_str = "default",
@@ -1266,8 +1408,9 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .choices = options_table_remain_on_exit_list,
 	  .default_num = 0,
-	  .text = "Whether panes should remain ('on') or be automatically "
-		  "killed ('off' or 'failed') when the program inside exits."
+	  .text = "Whether panes should remain ('on'), remain until a key is "
+		  "pressed ('key') or be automatically killed ('off' or "
+		  "'failed') when the program inside exits."
 	},
 
 	{ .name = "remain-on-exit-format",
@@ -1275,12 +1418,12 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_str = "Pane is dead ("
 			 "#{?#{!=:#{pane_dead_status},},"
-	                 "status #{pane_dead_status},}"
+			 "status #{pane_dead_status},}"
 			 "#{?#{!=:#{pane_dead_signal},},"
-	                 "signal #{pane_dead_signal},}, "
+			 "signal #{pane_dead_signal},}, "
 			 "#{t:pane_dead_time})",
 	  .text = "Message shown after the program in a pane has exited, if "
-	          "remain-on-exit is enabled."
+		  "remain-on-exit is enabled."
 	},
 
 	{ .name = "scroll-on-clear",
@@ -1296,6 +1439,16 @@ const struct options_table_entry options_table[] = {
 	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
 	  .default_num = 0,
 	  .text = "Whether typing should be sent to all panes simultaneously."
+	},
+
+	{ .name = "tiled-layout-max-columns",
+	  .type = OPTIONS_TABLE_NUMBER,
+	  .scope = OPTIONS_TABLE_WINDOW,
+	  .minimum = 0,
+	  .maximum = USHRT_MAX,
+	  .default_num = 0,
+	  .text = "Maximum number of columns in the 'tiled' layout. "
+		  "A value of 0 means no limit."
 	},
 
 	{ .name = "window-active-style",
