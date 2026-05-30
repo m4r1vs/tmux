@@ -82,6 +82,7 @@ spawn_window(struct spawn_context *sc, char **cause)
 	struct winlink		*wl;
 	int			 idx = sc->idx;
 	u_int			 sx, sy, xpixel, ypixel;
+	char			*name;
 
 	spawn_log(__func__, sc);
 
@@ -180,8 +181,11 @@ spawn_window(struct spawn_context *sc, char **cause)
 	if (~sc->flags & SPAWN_RESPAWN) {
 		free(w->name);
 		if (sc->name != NULL) {
-			w->name = format_single(item, sc->name, c, s, NULL,
-			    NULL);
+			name = format_single(item, sc->name, c, s, NULL, NULL);
+			w->name = clean_name(name, "#");
+			free(name);
+			if (w->name == NULL)
+				w->name = xstrdup("");
 			options_set_number(w->options, "automatic-rename", 0);
 		} else
 			w->name = default_window_name(w);
@@ -277,6 +281,13 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	}
 
 	/*
+	 * If window currently zoomed, window_set_active_pane calls
+	 * window_unzoom which it copies back the saved_layout_cell.
+	 */
+	if (w->flags & WINDOW_ZOOMED)
+		new_wp->saved_layout_cell = new_wp->layout_cell;
+
+	/*
 	 * Now we have a pane with nothing running in it ready for the new
 	 * process. Work out the command and arguments and store the working
 	 * directory.
@@ -368,7 +379,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		goto complete;
 	}
 
-    /* Store current working directory and change to new one. */
+	/* Store current working directory and change to new one. */
 	if (getcwd(path, sizeof path) != NULL) {
 		if (chdir(new_wp->cwd) == 0)
 			actual_cwd = new_wp->cwd;
